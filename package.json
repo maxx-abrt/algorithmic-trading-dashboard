@@ -6,12 +6,7 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint .",
-    "convex": "convex dev",
-    "worker": "tsx watch --clear-screen=false worker/src/index.ts",
-    "worker:once": "tsx worker/src/index.ts",
-    "setup": "convex dev --once",
-    "all": "concurrently -k -n convex,next,worker -c magenta,cyan,green \"convex dev\" \"next dev\" \"tsx watch --clear-screen=false worker/src/index.ts\""
+    "lint": "eslint ."
   },
   "dependencies": {
     "@base-ui/react": "^1.5.0",
@@ -20,6 +15,7 @@
     "clsx": "^2.1.1",
     "convex": "^1.42.3",
     "dotenv": "^17.4.2",
+    "lightweight-charts": "^4.2.3",
     "lucide-react": "^1.16.0",
     "next": "16.2.6",
     "next-themes": "^0.4.6",
