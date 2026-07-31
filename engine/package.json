@@ -1,0 +1,25 @@
+{
+  "name": "@apex/engine",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "description": "APEX-02 decision engine: OKX market ingestion, quantitative brain, AI arbitration, alerting and Telegram companion.",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch --clear-screen=false src/index.ts",
+    "poc": "tsx scripts/poc.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "convex": "1.42.3",
+    "dotenv": "17.4.2",
+    "technicalindicators": "3.1.0",
+    "ws": "8.21.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.10.1",
+    "@types/ws": "8.18.1",
+    "tsx": "4.23.1",
+    "typescript": "5.7.3"
+  }
+}

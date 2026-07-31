@@ -1,0 +1,159 @@
+@import 'tailwindcss';
+
+/* ==========================================================================
+   MYCROFT / APEX-02 — institutional dark terminal
+   Dark only, on purpose: this is a trading console, not a marketing site.
+   ========================================================================== */
+
+@theme inline {
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, SFMono-Regular, monospace;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-2: var(--card-2);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-ring: var(--ring);
+
+  --color-bull: var(--state-bull);
+  --color-bear: var(--state-bear);
+  --color-neutral: var(--state-neutral);
+  --color-warning: var(--state-warning);
+  --color-veto: var(--state-veto);
+  --color-info: var(--state-info);
+  --color-accent: var(--state-bull);
+
+  --shadow-panel: 0 0 0 1px color-mix(in oklab, var(--border) 85%, transparent);
+  --shadow-float: 0 18px 44px -22px rgb(0 0 0 / 0.75);
+
+  --ease-out-quint: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+:root {
+  --background: oklch(0.16 0.004 285);
+  --foreground: oklch(0.96 0.002 285);
+  --card: oklch(0.195 0.005 285);
+  --card-2: oklch(0.225 0.006 285);
+  --muted: oklch(0.26 0.006 285);
+  --muted-foreground: oklch(0.7 0.008 285);
+  --border: oklch(0.28 0.006 285);
+  --border-strong: oklch(0.36 0.008 285);
+  --ring: oklch(0.78 0.19 150);
+
+  --state-bull: oklch(0.78 0.19 150);
+  --state-bear: oklch(0.66 0.21 25);
+  --state-neutral: oklch(0.7 0.008 285);
+  --state-warning: oklch(0.82 0.15 85);
+  --state-veto: oklch(0.62 0.24 15);
+  --state-info: oklch(0.78 0.12 210);
+
+  --nav-height: 52px;
+  color-scheme: dark;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-feature-settings: 'cv02', 'cv03', 'cv04';
+}
+
+/* Prices, indicators and logs: monospace + tabular figures, always. */
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* ---- scrollbars ---------------------------------------------------------- */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: oklch(0.32 0.006 285);
+  border-radius: 999px;
+  border: 2px solid var(--background);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.42 0.008 285);
+}
+
+/* ---- motion (subtle, informative only) ---------------------------------- */
+@keyframes flash-bull {
+  0% {
+    background-color: color-mix(in oklab, var(--state-bull) 26%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+@keyframes flash-bear {
+  0% {
+    background-color: color-mix(in oklab, var(--state-bear) 26%, transparent);
+  }
+  100% {
+    background-color: transparent;
+  }
+}
+.flash-bull {
+  animation: flash-bull 420ms var(--ease-out-quint);
+}
+.flash-bear {
+  animation: flash-bear 420ms var(--ease-out-quint);
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.86);
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--card-2);
+}
+.skeleton::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.05), transparent);
+  animation: shimmer 1.6s infinite;
+}
+
+.panel-grid {
+  background-image: radial-gradient(circle at 1px 1px, oklch(0.3 0.006 285) 1px, transparent 0);
+  background-size: 22px 22px;
+}
