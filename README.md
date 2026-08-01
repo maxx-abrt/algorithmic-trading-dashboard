@@ -6,6 +6,7 @@ full quantitative stack locally, has an LLM argue against its own conclusions, a
 
 It never places an order. There is deliberately no trade endpoint anywhere in the codebase.
 
+
 ```
             ┌──────────────────────────────────────────────────────────────┐
   OKX v5 ──▶│  engine/  (Node · TypeScript · 24/7)                         │
