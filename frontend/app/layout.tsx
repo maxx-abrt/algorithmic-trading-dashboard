@@ -29,8 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <main className="mx-auto w-full max-w-[1920px] flex-1 px-3 pb-10 pt-3 sm:px-4 lg:px-6">{children}</main>
             <footer className="border-t border-border px-4 py-3">
               <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
-                MYCROFT decides, you execute · this engine never places an order · leveraged derivatives can
-                liquidate your entire balance
+               MYCROFT Trading Engine - 2026 - Max Aubert
               </p>
             </footer>
           </div>

@@ -52,7 +52,7 @@ export function TopNav() {
         </nav>
 
         <span className="hidden shrink-0 rounded border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground md:inline">
-          decisions only · no auto-trading
+          MYCROFT Trading
         </span>
       </div>
     </header>
