@@ -8,18 +8,26 @@
     "start": "tsx src/index.ts",
     "dev": "tsx watch --clear-screen=false src/index.ts",
     "poc": "tsx scripts/poc.ts",
+    "core:poc": "tsx scripts/core-poc.ts",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "better-sqlite3": "11.10.0",
     "convex": "1.42.3",
     "dotenv": "17.4.2",
+    "parquetjs-lite": "^0.8.7",
     "technicalindicators": "3.1.0",
-    "ws": "8.21.1"
+    "ws": "8.21.1",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
     "@types/node": "24.10.1",
     "@types/ws": "8.18.1",
+    "fast-check": "^4.9.0",
     "tsx": "4.23.1",
-    "typescript": "5.7.3"
+    "typescript": "5.7.3",
+    "vitest": "3.2.4"
   }
 }

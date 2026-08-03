@@ -1,8 +1,6 @@
 'use client'
 
 import { useState } from 'react'
-import { useQuery } from 'convex/react'
-import { api as convexApi } from '@/convex/_generated/api'
 import { del, post, usePoll } from '@/lib/api'
 import type { AlertEvent, AlertRule, WatchRow } from '@/lib/types'
 import {
@@ -53,9 +51,9 @@ const NEEDS_DIRECTION = new Set(['signal', 'price_cross', 'rsi_level', 'pattern'
 const NEEDS_THRESHOLD = new Set(['signal', 'conviction', 'pct_move', 'funding_extreme', 'oi_spike', 'pattern', 'vol_spike'])
 
 export default function AlertsPage() {
-  const state = usePoll<{ rules: AlertRule[]; types: { type: string; label: string }[] }>('/alerts', 8000)
+  const state = usePoll<{ rules: AlertRule[]; events: AlertEvent[]; types: { type: string; label: string }[] }>('/alerts', 8000)
   const watchlist = usePoll<WatchRow[]>('/watchlist', 20000)
-  const events = useQuery(convexApi.alerts.listEvents, { limit: 60 }) as AlertEvent[] | undefined
+  const events = state.data?.events
   const [draft, setDraft] = useState<Draft | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -208,7 +206,7 @@ export default function AlertsPage() {
       <Panel
         className="xl:col-span-4"
         title="Trigger history"
-        subtitle="reactive feed from Convex"
+        subtitle="durable local alert ledger"
         bodyClassName="p-0"
       >
         <div data-testid="alerts-trigger-history" className="max-h-[640px] overflow-y-auto divide-y divide-border/60">

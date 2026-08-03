@@ -1,7 +1,6 @@
 'use client'
 
-import { useQuery } from 'convex/react'
-import { api } from '@/convex/_generated/api'
+import { usePoll } from '@/lib/api'
 import { Badge, Panel } from '@/components/ui/kit'
 import { cn } from '@/lib/utils'
 import { clockUtc } from '@/lib/format'
@@ -22,14 +21,15 @@ const FILTERS = ['all', 'signal', 'ai', 'alert', 'scan', 'error'] as const
 
 export function LogTerminal({ className }: { className?: string }) {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>('all')
-  const rows = useQuery(api.logs.list, { limit: 150 }) as LogEntry[] | undefined
+  const logState = usePoll<LogEntry[]>('/logs?limit=150', 3000)
+  const rows = logState.data
   const filtered = (rows ?? []).filter((r) => (filter === 'all' ? true : r.level === filter))
 
   return (
     <Panel
       className={className}
       title="Engine terminal"
-      subtitle="reactive stream from Convex — quant evaluations, AI verdicts, alerts"
+      subtitle="local engine stream — quant evaluations, research, paper events and alerts"
       actions={
         <div className="flex items-center gap-0.5">
           {FILTERS.map((f) => (
@@ -51,8 +51,8 @@ export function LogTerminal({ className }: { className?: string }) {
       bodyClassName="p-0"
     >
       <div data-testid="log-terminal" className="max-h-[280px] min-h-[140px] overflow-y-auto px-2.5 py-2">
-        {rows === undefined && <div className="skeleton h-24 rounded" />}
-        {rows !== undefined && filtered.length === 0 && (
+        {logState.loading && rows === null && <div className="skeleton h-24 rounded" />}
+        {!logState.loading && rows !== null && filtered.length === 0 && (
           <p className="py-8 text-center text-xs text-muted-foreground">No log lines at this level yet.</p>
         )}
         <ul className="space-y-0.5">

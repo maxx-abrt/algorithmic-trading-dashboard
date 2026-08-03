@@ -7,6 +7,8 @@
  *                            a thin proxy in front of this very port
  */
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { statSync } from 'node:fs'
+import { join } from 'node:path'
 import { ENV } from './env.js'
 import { log } from './log.js'
 import { runtime } from './runtime.js'
@@ -103,11 +105,14 @@ const routes: Record<string, Handler> = {
     const key = runtime.key(instId, bar)
     const analysis = runtime.analyses.get(key) ?? (await runtime.analyzeInstrument(instId, bar, { withAi: false, silent: true }))
     if (!analysis) throw new Error('no analysis available')
+    const usage = runtime.store.aiUsageThisMonth()
+    if (usage.spend >= runtime.settings.aiMonthlyBudgetEur) throw new Error('monthly AI budget reached')
     if (!runtime.gemini.configured) throw new Error('GEMINI_API_KEY is not configured')
     const opinion = await runtime.gemini.decide(analysis, runtime.settings.ai)
     analysis.ai = opinion
     runtime.analyses.set(key, analysis)
     if (opinion) {
+      runtime.store.recordAiUsage(opinion.model, opinion.tokensIn, opinion.tokensOut, (opinion.tokensIn * 0.3 + opinion.tokensOut * 2.5) / 1_000_000)
       log.ai('gemini', `manual review ${instId} ${bar} → ${opinion.decision} @ ${opinion.confidence}%`, { instId, timeframe: bar })
     }
     return { opinion, analysis }
@@ -160,8 +165,7 @@ const routes: Record<string, Handler> = {
     const instId = runtime.resolveInstId(String(body.instId ?? ''))
     if (!instId) throw new Error('unknown instrument')
     const spec = runtime.universe.get(instId)
-    await convex.addWatch(instId, spec?.instType ?? 'SWAP', normalizeBar(String(body.timeframe ?? runtime.settings.timeframe)), body.note ? String(body.note) : undefined)
-    await runtime.refreshSettings()
+    await runtime.addWatch(instId, spec?.instType ?? 'SWAP', normalizeBar(String(body.timeframe ?? runtime.settings.timeframe)), body.note ? String(body.note) : undefined)
     runtime.syncSubscriptions()
     void runtime.analyzeInstrument(instId, String(body.timeframe ?? runtime.settings.timeframe), { withAi: false, silent: true })
     return { ok: true, instId }
@@ -170,8 +174,7 @@ const routes: Record<string, Handler> = {
   'DELETE /api/watchlist': async (_req, _res, url) => {
     const instId = url.searchParams.get('instId')
     if (!instId) throw new Error('instId required')
-    await convex.removeWatch(instId)
-    await runtime.refreshSettings()
+    await runtime.removeWatch(instId)
     runtime.syncSubscriptions()
     return { ok: true }
   },
@@ -184,8 +187,7 @@ const routes: Record<string, Handler> = {
     for (const k of ['enabled', 'alertsEnabled', 'timeframe', 'note']) {
       if (body[k] !== undefined) patch[k] = body[k]
     }
-    await convex.patchWatch(instId, patch as never)
-    await runtime.refreshSettings()
+    await runtime.patchWatch(instId, patch as never)
     return { ok: true }
   },
 
@@ -203,7 +205,7 @@ const routes: Record<string, Handler> = {
 
   'GET /api/alerts': async (_req, _res, url) => ({
     rules: runtime.rules,
-    events: (await convex.listAlertEvents(num(url.searchParams.get('limit'), 60))) ?? [],
+    events: runtime.store.listAlerts(num(url.searchParams.get('limit'), 60)),
     types: ALERT_TYPES.map((t) => ({ type: t, label: ALERT_TYPE_LABELS[t] })),
   }),
 
@@ -225,16 +227,14 @@ const routes: Record<string, Handler> = {
       telegram: body.telegram !== false,
       enabled: body.enabled !== false,
     }
-    const id = await convex.upsertRule(rule)
-    await runtime.refreshSettings()
+    const id = await runtime.upsertAlertRule(rule as never)
     return { ok: Boolean(id), id }
   },
 
   'DELETE /api/alerts/rules': async (_req, _res, url) => {
     const id = url.searchParams.get('id')
     if (!id) throw new Error('id required')
-    await convex.deleteRule(id)
-    await runtime.refreshSettings()
+    await runtime.deleteAlertRule(id)
     return { ok: true }
   },
 
@@ -254,9 +254,66 @@ const routes: Record<string, Handler> = {
   },
 
   'GET /api/journal': async (_req, _res, url) => ({
-    signals: (await convex.listSignals(num(url.searchParams.get('limit'), 80), url.searchParams.get('status') ?? 'all')) ?? [],
-    stats: (await convex.signalStats()) ?? null,
+    trades: runtime.store.listTrades(num(url.searchParams.get('limit'), 120), url.searchParams.get('status') ?? 'all'),
+    stats: runtime.store.paperStats(),
   }),
+
+  'GET /api/candidates': (_req, _res, url) => ({
+    rows: runtime.store.listCandidates(num(url.searchParams.get('limit'), 200), url.searchParams.get('instId') ?? undefined),
+    live: [...runtime.latestCandidates.entries()].map(([key, candidates]) => ({ key, candidates })),
+  }),
+
+  'GET /api/paper': (_req, _res, url) => ({
+    trades: runtime.store.listTrades(num(url.searchParams.get('limit'), 200), url.searchParams.get('status') ?? 'all'),
+    stats: runtime.store.paperStats(),
+    killSwitch: runtime.paperKillSwitch,
+    lastRiskDecision: runtime.store.getState('last_risk_decision', null),
+    policy: {
+      maxOpenPositions: runtime.settings.maxOpenPositions,
+      maxDailyLossPct: runtime.settings.maxDailyLossPct,
+      maxOpenRiskPct: runtime.settings.maxOpenRiskPct,
+      maxGrossExposurePct: runtime.settings.maxGrossExposurePct,
+    },
+  }),
+
+  'POST /api/paper/kill': async (req) => {
+    const body = await readBody(req)
+    runtime.paperKillSwitch = body.enabled === undefined ? !runtime.paperKillSwitch : Boolean(body.enabled)
+    runtime.store.setState('paper_kill_switch', runtime.paperKillSwitch)
+    return { enabled: runtime.paperKillSwitch, note: 'Paper candidate arming only; no exchange orders exist' }
+  },
+
+  'GET /api/research': () => ({ ...runtime.store.researchState(), governor: runtime.research.governor() }),
+
+  'POST /api/research/run': async (req) => {
+    const body = await readBody(req)
+    return await runtime.research.run({
+      symbols: Array.isArray(body.symbols) ? body.symbols.map(String) : undefined,
+      timeframe: ['5m', '15m', '1H'].includes(String(body.timeframe)) ? String(body.timeframe) as '5m' | '15m' | '1H' : undefined,
+      maxEvaluations: body.maxEvaluations == null ? undefined : Number(body.maxEvaluations),
+      hypothesis: body.hypothesis ? String(body.hypothesis) : undefined,
+    })
+  },
+
+  'GET /api/operations': () => ({
+    health: runtime.health(),
+    qualityEvents: runtime.store.listQualityEvents(100),
+    lastBackup: runtime.store.getState('last_backup', null),
+    lastParquetExport: runtime.store.getState('last_parquet_export', null),
+    database: { path: runtime.store.path, bytes: (() => { try { return statSync(runtime.store.path).size } catch { return 0 } })() },
+    aiUsage: runtime.store.aiUsageThisMonth(),
+  }),
+
+  'POST /api/operations/export': async (req) => {
+    const body = await readBody(req)
+    const destination = join(process.cwd(), 'backups', `candles-${new Date().toISOString().slice(0, 10)}.parquet`)
+    return await runtime.store.exportCandlesToParquet(destination, body.instId ? String(body.instId) : undefined, body.timeframe ? String(body.timeframe) : undefined)
+  },
+
+  'POST /api/operations/backup': async () => {
+    const destination = join(process.cwd(), 'backups', `mycroft-${new Date().toISOString().replace(/[:.]/g, '-')}.sqlite`)
+    return await runtime.store.backup(destination)
+  },
 
   'GET /api/ai/models': async (_req, _res, url) => {
     if (!runtime.gemini.configured) return { models: [], error: 'GEMINI_API_KEY not configured' }

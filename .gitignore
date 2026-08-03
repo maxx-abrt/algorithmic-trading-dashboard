@@ -12,6 +12,10 @@ out/
 build/
 dist/
 *.tsbuildinfo
+coverage/
+engine/data/
+engine/backups/
+artifacts/
 next-env.d.ts
 .cache/
 .ruff_cache/

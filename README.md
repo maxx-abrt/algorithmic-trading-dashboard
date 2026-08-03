@@ -1,138 +1,96 @@
-# MYCROFT · APEX-02 — OKX decision terminal
+# MYCROFT — OKX Research OS
 
-An institutional-grade **decision companion** for OKX: it ingests real market data, runs a
-full quantitative stack locally, has an LLM argue against its own conclusions, and tells you
-**what to do, where the stop goes, where the targets are and how much to commit**.
+A local-first decision-support and quantitative research system for OKX. It collects real public market data, explains explicit strategy candidates, simulates them with a stateful paper broker, and rejects models that fail leakage-aware validation.
 
-It never places an order. There is deliberately no trade endpoint anywhere in the codebase.
+**MYCROFT never places, amends, or cancels an order.** There is no trade endpoint in the codebase. Every LONG/SHORT plan is advisory and is automatically evaluated as a paper hypothesis.
 
+## What is implemented
 
+- **Real OKX data:** public REST + WebSocket instruments, tickers, candles, funding, open interest, basis, order-book imbalance, taker flow, and positioning statistics
+- **Core horizons:** 5m, 15m, and 1H; BTC/ETH perpetual focus, liquid swap scanner, and a default spot basket covering BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, and LINK
+- **Closed-bar analysis:** forming candles are excluded from decisions; gaps and repairs are explicit data-quality events
+- **Explicit playbooks:** trend pullback, volatility breakout, and range fade expose prerequisites, triggers, invalidation, and rejection reasons
+- **Paper broker:** pending entry zones, conservative fills, stop-first intrabar ambiguity, TP ladder, break-even after TP1, ATR trailing after TP2, time stops, gaps, fees, slippage, and funding
+- **Portfolio gates:** open-position, daily-loss, instrument-risk, portfolio-risk, gross-exposure, duplicate-exposure, and paper kill-switch controls
+- **Durable truth:** SQLite WAL stores candles, decisions, candidates, paper events, risk state, research campaigns, trials, models, quality events, and optional outbox data
+- **Honest research:** point-in-time slicing, purged chronological folds, embargoes, held-out ETH checks, bootstrap confidence bounds, deflated-Sharpe penalty, and explicit rejection gates
+- **Governed improvement:** bounded campaigns, resource governor, immutable manifests, model registry, shadow-only promotion state, and `NO_VALIDATED_MODEL` as a normal outcome
+- **Operations:** feed health, RAM/load, data quality, AI budget circuit breaker, online SQLite backup, and Coolify deployment files
+- **Optional Gemini:** adversarial summary/risk critique only. Local quant remains authoritative. Calls are cached, counted, and blocked at the configured monthly budget (maximum €10 in the UI)
 
-```
-            ┌──────────────────────────────────────────────────────────────┐
-  OKX v5 ──▶│  engine/  (Node · TypeScript · 24/7)                         │
-  REST+WS   │  universe · candle memory · 60+ indicators · candlestick      │
-            │  confirmation · volatility models · statistics · empirical    │
-            │  edge · vetoes · risk plan · Gemini arbitration · alerts      │
-            └───────┬───────────────────────────────┬──────────────────────┘
-                    │ HTTP /api/*                   │ writes
-            ┌───────▼──────────┐           ┌────────▼─────────┐
-            │ frontend/ (Next) │◀──────────│  Convex (cloud)  │
-            │  terminal · chart│  reactive │ settings · alerts│
-            │  scanner · alerts│  useQuery │ journal · logs   │
-            └──────────────────┘           └──────────────────┘
-                    │                               ▲
-                    │                               │
-              your browser                   Telegram bot (24/7)
-```
+## Architecture
 
-## What it actually does
-
-**Universe.** All ~1,900 live OKX instruments: perpetual swaps, dated futures, spot and the
-tokenized US-equity swaps (`NVDA-USDT-SWAP`, `TSLA-USDT-SWAP`, `MSTR-USDT-SWAP`…). Searchable,
-scannable, analysable on demand.
-
-**Memory.** Up to 600 bars per instrument and timeframe in RAM, seeded over REST, kept hot by two
-WebSocket families, gap-audited and repaired from `history-candles`. The forming bar is dropped
-before any maths runs, so a signal can never repaint.
-
-**Brain (all local, zero token cost).**
-
-| Layer | What is computed |
-|---|---|
-| Trend | EMA 9/21/50/100/200 ribbon + slopes + stacking, SMA 20/50/200, Supertrend, PSAR, Aroon, Chandelier, ADX/DI, full Ichimoku, Donchian, VWMA, Vortex, Heikin-Ashi runs |
-| Momentum | RSI (+SMA), StochRSI, Stochastic, MACD histogram acceleration, CCI, Williams %R, ROC, Awesome, TRIX, KST, Ultimate Oscillator, MFI |
-| Volatility | ATR + percentile, Bollinger + %B + width percentile, Keltner, TTM squeeze, Choppiness, Kaufman efficiency, realised vol, **Parkinson**, **Garman-Klass**, **EWMA(0.94) forecast**, vol-of-vol, expected move over the holding horizon, hour-of-day vol profile, climax detection |
-| Flow | OBV, ADL, MFI, Force Index, CVD proxy + slope, anchored VWAP + σ bands + z-score, volume profile (POC/VAH/VAL/HVN/LVN), relative volume |
-| Structure | fractal swings, HH/HL/LH/LL, BOS, CHoCH, fair-value gaps, confluence S/R clustering with HTF swings, Fibonacci, range position, measured moves |
-| Patterns | **34 candlestick formations** from `technicalindicators`, each re-scored by context: location vs level/band, body vs ATR, volume confirmation, prior leg, follow-through, freshness |
-| Statistics | **Hurst exponent**, log-price regression channel with R² and slope t-stat, z-score, lag-1 autocorrelation, skew, kurtosis |
-| Divergence | RSI / MACD / OBV, regular and hidden, multi-pivot |
-| Derivatives | funding + next settlement, open interest and its change, taker buy/sell ratio, long/short account ratio, depth-weighted book imbalance, mark/index basis, spread |
-| **Empirical edge** | fingerprints the current context and replays every historical analogue with the *same* stop and target → real hit rate, average R, MFE/MAE, sample-shrunk expectancy |
-
-All of it collapses into a weighted, regime-adaptive factor model (~30 factors), a veto layer
-(hard blockers vs soft penalties), a playbook selector (8 playbooks) and a risk plan:
-structure/ATR/trailing-system stop, three-target ladder with allocations, blended R:R, leverage
-capped by volatility *and* conviction *and* session, position size, liquidation distance, and
-expectancy **net of fees, funding and spread slippage**.
-
-**AI arbitration.** Gemini is called *only* when the local stack already found a setup, with a
-pre-computed brief (~300 tokens compact, ~2.5k standard) and a response cache. Its job is to
-attack the idea, not to invent numbers.
-
-**Alerts + Telegram.** 13 rule types (signal, conviction, price cross, % move, RSI level, squeeze
-fire, funding extreme, OI spike, pattern, regime change, level break, vol spike, divergence) with
-scope, cooldown and de-duplication. Cards land on Telegram with an unambiguous ACTION block.
-Commands: `/status /analyze BTC 15m /watch NVDA 1H /unwatch /list /scan /settings /mute /help`.
-
-**Journal.** Every issued idea is stored and then replayed against real candles: targets fill in
-order, the stop moves to break-even after TP1, and MFE/MAE/realised R are graded automatically.
-
-## Quick start
-
-```bash
-git clone https://github.com/maxx-abrt/algorithmic-trading-dashboard.git
-cd algorithmic-trading-dashboard
-
-# 1. Convex (system of record + realtime)
-cd frontend && npx convex dev          # writes NEXT_PUBLIC_CONVEX_URL, then Ctrl-C
-npx convex env set WORKER_API_KEY "$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')"
-
-# 2. Secrets
-cd .. && cp .env.example engine/.env    # fill CONVEX_URL, WORKER_API_KEY, GEMINI_API_KEY, TELEGRAM_BOT_TOKEN
-
-# 3. Install + run (two terminals)
-cd engine   && yarn install && yarn start   # decision engine on :8790
-cd frontend && yarn install && yarn dev     # dashboard on :3000
+```text
+OKX public REST + WebSocket
+            |
+            v
+engine/  Node + TypeScript
+  live analysis | paper broker | SQLite WAL | bounded research
+            |
+          /api/*
+            |
+frontend/ Next.js + React
+  terminal | scanner | portfolio | journal | research | operations
 ```
 
-Open <http://localhost:3000>, then send `/start` to your BotFather bot to register for alerts.
+Convex remains supported as an optional mirror for existing installations, but it is not required. SQLite is the local source of truth.
 
-**No OKX API key is required** — every market endpoint used here is public. Adding *read-only*
-keys unlocks balance-aware position sizing only.
+## Local start
 
-## Repository layout
-
-```
-engine/                 the brain (runs 24/7, owns all live state)
-  src/okx/              v5 REST client (rate-limited, HMAC signing), WS transport, market layer
-  src/store/            rolling candle memory with gap repair
-  src/quant/            indicators · extras · stats · sessions · structure · patterns ·
-                        edge · scoring · risk · engine (orchestrator)
-  src/ai/gemini.ts      trigger-gated arbitration, strict JSON schema, cache, cost counters
-  src/telegram/         transport + card renderer
-  src/alerts/rules.ts   13 rule evaluators (pure functions)
-  src/journal.ts        outcome grading
-  src/runtime.ts        loops: settings, tickers, focus, watchlist, scanner, journal, telemetry
-  src/server.ts         HTTP API consumed by the dashboard
-  scripts/poc.ts        end-to-end live proof (Convex, OKX, WS, quant, Gemini, Telegram)
-  scripts/decision-audit.ts  gate calibration report over the liquid universe
-  scripts/preview-card.ts    render a Telegram card in the terminal
-frontend/               Next.js 16 dashboard (terminal, scanner, watchlist, alerts, journal, settings)
-  convex/               schema + queries/mutations (single writer: the engine)
-backend/server.py       thin /api gateway, only needed on hosts that reserve :8001 for the API
-```
-
-## Useful scripts
+Requirements: Node 20+, Yarn 1.x.
 
 ```bash
 cd engine
-yarn poc                                   # 50-check live proof of the whole core
-yarn tsx scripts/decision-audit.ts 14 15m 1H   # verdict distribution + veto histogram
-yarn tsx scripts/preview-card.ts NVDA-USDT-SWAP 1H   # see the Telegram card as text
+yarn install --frozen-lockfile
 yarn typecheck
+yarn test
+yarn core:poc       # live OKX public-data proof; creates only temporary state
+yarn start          # engine on :8790
 ```
 
-## Operating notes
+In a second terminal:
 
-- **WAIT is a valid answer.** The gate stack is intentionally strict; a healthy configuration
-  produces roughly 10–30% actionable setups. `scripts/decision-audit.ts` tells you where you are,
-  and every WAIT still shows the *shadow plan* — where the trade would live if it confirmed.
-- **Tokenized equities are session-aware.** Outside US regular hours conviction is damped,
-  leverage is halved and the weekend is a hard blocker: the underlying cannot hedge.
-- **Convex usage is deliberately tiny** (a few thousand writes a day): live market state is served
-  from the engine over HTTP, only configuration and history live in the database.
-- **Nothing is mocked.** Every number on screen comes from OKX, computed locally.
+```bash
+cd frontend
+yarn install --frozen-lockfile
+yarn build
+yarn dev            # dashboard on :3000; /api rewrites to :8790
+```
 
-Not financial advice. Leveraged derivatives can liquidate your entire balance.
+No OKX API key is required or recommended for this paper-only build.
+
+## Verification
+
+```bash
+cd engine
+
+yarn typecheck
+yarn test
+yarn core:poc
+
+cd ../frontend
+yarn build
+```
+
+The core POC uses confirmed real BTC-USDT-SWAP candles and verifies OKX contracts, SQLite recovery, candidate/rejection persistence, the paper state machine, and purged walk-forward splits. A negative result is valid: the objective is to reject false edge, not force a profitable-looking report.
+
+## Coolify
+
+Use `docker-compose.yml` and route the public domain to the frontend service on port 3000. Keep the data and backup volumes persistent. Full instructions are in [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md).
+
+Optional secrets belong in Coolify environment variables, never Git:
+
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+## Interpretation limits
+
+- Scenario win estimates from the legacy heuristic layer are labeled unvalidated unless backed by an empirical sample.
+- Backtests and paper fills cannot guarantee live execution quality or future returns.
+- The model registry begins in `NO_VALIDATED_MODEL` and stays there until every statistical, risk, and held-out gate passes.
+- AI output cannot authorize a signal, change paper-broker truth, or create an order.
+- Public OKX data use remains subject to OKX terms and redistribution limits.
+
+Not financial advice. Leveraged derivatives can cause rapid and total loss.

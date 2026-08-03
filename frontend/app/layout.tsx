@@ -8,9 +8,9 @@ import { Toaster } from 'sonner'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'MYCROFT · OKX Decision Terminal',
+  title: 'MYCROFT · OKX Research OS',
   description:
-    'Institutional OKX decision companion: multi-timeframe quant engine, candlestick confirmation, volatility modelling, empirical edge, alerts and Telegram — manual execution only.',
+    'Real-data OKX research, paper simulation and leakage-aware validation. Advisory only; no order execution.',
 }
 
 export const viewport: Viewport = {
@@ -26,10 +26,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <div className="flex min-h-screen flex-col">
             <TopNav />
             <StatusBar />
-            <main className="mx-auto w-full max-w-[1920px] flex-1 px-3 pb-10 pt-3 sm:px-4 lg:px-6">{children}</main>
+            <main className="mx-auto w-full max-w-[1920px] flex-1 px-3 pb-24 pt-3 sm:px-4 md:pb-10 lg:px-6">{children}</main>
             <footer className="border-t border-border px-4 py-3">
               <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
-               MYCROFT Trading Engine - 2026 - Max Aubert
+               Real OKX market data · Paper research only · No order execution · Unvalidated edges are labeled
               </p>
             </footer>
           </div>

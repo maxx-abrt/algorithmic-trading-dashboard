@@ -402,8 +402,10 @@ export interface RiskPlan {
   /** price that invalidates the whole idea (structural) */
   invalidation: number
   timeStopBars: number
-  /** win-prob estimate implied by conviction, 0..1 */
+  /** scenario estimate; inspect probabilityBasis before interpreting */
   winProbability: number
+  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior'
+  validationState: 'INSUFFICIENT_EVIDENCE' | 'RESEARCH_CANDIDATE'
   expectancyR: number
   kellyFraction: number
   /** round-trip taker fees in USD at the suggested size */

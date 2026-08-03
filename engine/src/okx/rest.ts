@@ -115,9 +115,7 @@ function bucketFor(path: string): Bucket {
       ? 'public'
       : path.startsWith('/api/v5/rubik')
         ? 'rubik'
-        : path.startsWith('/api/v5/trade')
-          ? 'trade'
-          : 'account'
+        : 'account'
 
   let b = buckets.get(family)
   if (!b) {
@@ -125,7 +123,6 @@ function bucketFor(path: string): Bucket {
       market: [18, 9],
       public: [18, 9],
       rubik: [4, 2],
-      trade: [55, 27],
       account: [8, 4],
     }
     const [capacity, refill] = cfg[family]

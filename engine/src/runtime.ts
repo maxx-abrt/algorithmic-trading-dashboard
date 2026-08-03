@@ -9,6 +9,7 @@
  *   • evaluate alert rules, push Telegram cards, journal and grade every idea
  *   • never place an order: this system decides, the human executes
  */
+import { loadavg, freemem, totalmem } from 'node:os'
 import { ENV, HAS_OKX_KEYS } from './env.js'
 import { log } from './log.js'
 import { convex, type AlertRuleRow, type SignalRow, type WatchRow } from './convex/client.js'
@@ -34,6 +35,12 @@ import { TelegramBot } from './telegram/bot.js'
 import { alertCard, signalCard, statusCard, HELP } from './telegram/cards.js'
 import { evaluateRule, scopeMatches, type AlertCandidate } from './alerts/rules.js'
 import { gradeSignal, toSignalRecord } from './journal.js'
+import { DurableStore } from './store/durable.js'
+import { evaluateStrategies, type StrategyCandidate } from './strategies/registry.js'
+import { createPaperPlan, processPaperBar, submitPaperPlan } from './paper/broker.js'
+import { assessPaperRisk, DEFAULT_RISK_POLICY } from './paper/risk.js'
+import type { PaperTrade } from './paper/types.js'
+import { ResearchLab } from './research/lab.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
 /* -------------------------------------------------------------------------- */
@@ -61,6 +68,11 @@ export interface RuntimeSettings {
   equityUsd: number
   useAccountBalance: boolean
   takerFeeBps: number
+  maxOpenPositions: number
+  maxDailyLossPct: number
+  maxOpenRiskPct: number
+  maxGrossExposurePct: number
+  aiMonthlyBudgetEur: number
   ai: AiConfig
   scanner: {
     enabled: boolean
@@ -105,6 +117,11 @@ export const FALLBACK_SETTINGS: RuntimeSettings = {
   equityUsd: ENV.defaultEquityUsd,
   useAccountBalance: false,
   takerFeeBps: 5,
+  maxOpenPositions: 3,
+  maxDailyLossPct: 4,
+  maxOpenRiskPct: 3,
+  maxGrossExposurePct: 150,
+  aiMonthlyBudgetEur: 10,
   ai: {
     enabled: true,
     model: ENV.gemini.model,
@@ -118,7 +135,7 @@ export const FALLBACK_SETTINGS: RuntimeSettings = {
   scanner: {
     enabled: true,
     timeframe: '15m',
-    instTypes: ['SWAP'],
+    instTypes: ['SWAP', 'SPOT'],
     quoteCcy: 'USDT',
     minVol24hUsd: 5_000_000,
     universeSize: 60,
@@ -203,6 +220,11 @@ export class Runtime {
   chats: number[] = []
   mutedChats = new Set<number>()
   startedAt = Date.now()
+  store = new DurableStore()
+  research = new ResearchLab(this.store)
+  paperTrades = new Map<string, PaperTrade>()
+  paperKillSwitch = this.store.getState<boolean>('paper_kill_switch', false)
+  latestCandidates = new Map<string, StrategyCandidate[]>()
   counters = { evaluations: 0, alerts: 0, signals: 0, errors: 0, wsMessages: 0 }
   lastAlertAt = new Map<string, number>()
   private derivCache = new Map<string, { at: number; data: DerivativesBlock }>()
@@ -215,6 +237,8 @@ export class Runtime {
   universeLoadedAt = 0
 
   constructor() {
+    candleStore.attachDurableStore(this.store)
+    for (const trade of this.store.loadActiveTrades()) this.paperTrades.set(trade.id, trade)
     this.gemini = new GeminiOrchestrator(ENV.gemini.apiKey)
     this.bot = new TelegramBot(ENV.telegram.token)
     this.stream = new OkxStream({
@@ -268,7 +292,9 @@ export class Runtime {
     every(4_000, () => this.focusLoop(), 'focus')
     every(5_000, () => this.watchLoop(), 'watch')
     every(15_000, () => this.scanLoop(), 'scanner')
-    every(20_000, () => this.journalLoop(), 'journal')
+    every(20_000, () => this.journalLoop(), 'journal-mirror')
+    every(10_000, () => this.paperLoop(), 'paper-broker')
+    every(10 * 60_000, () => this.maintenanceLoop(), 'maintenance')
     every(30_000, () => this.telemetryLoop(), 'telemetry')
     every(5_000, () => log.flush(), 'logflush')
     every(60_000, () => this.refreshAccount(), 'account')
@@ -278,25 +304,27 @@ export class Runtime {
   /* ---- configuration --------------------------------------------------- */
 
   async refreshSettings() {
-    const row = (await convex.getSettings()) as Partial<RuntimeSettings> | null
-    if (row) {
-      this.settings = {
-        ...FALLBACK_SETTINGS,
-        ...row,
-        weights: { ...FALLBACK_SETTINGS.weights, ...(row.weights ?? {}) },
-        ai: { ...FALLBACK_SETTINGS.ai, ...(row.ai ?? {}) },
-        scanner: { ...FALLBACK_SETTINGS.scanner, ...(row.scanner ?? {}) },
-        telegram: { ...FALLBACK_SETTINGS.telegram, ...(row.telegram ?? {}) },
-      }
+    const local = this.store.getState<Partial<RuntimeSettings>>('settings', {})
+    const remote = convex.configured ? ((await convex.getSettings()) as Partial<RuntimeSettings> | null) : null
+    const row = remote ?? local
+    this.settings = {
+      ...FALLBACK_SETTINGS,
+      ...row,
+      weights: { ...FALLBACK_SETTINGS.weights, ...(row.weights ?? {}) },
+      ai: { ...FALLBACK_SETTINGS.ai, ...(row.ai ?? {}) },
+      scanner: { ...FALLBACK_SETTINGS.scanner, ...(row.scanner ?? {}) },
+      telegram: { ...FALLBACK_SETTINGS.telegram, ...(row.telegram ?? {}) },
     }
     if (this.settings.htfTimeframe === 'auto' || this.settings.htf2Timeframe === 'auto') {
       const [h1, h2] = higherTimeframes(this.settings.timeframe)
       if (this.settings.htfTimeframe === 'auto') this.settings.htfTimeframe = h1
       if (this.settings.htf2Timeframe === 'auto') this.settings.htf2Timeframe = h2
     }
-    const [wl, rules, chats] = await Promise.all([convex.listWatchlist(), convex.listRules(), convex.listChats()])
-    if (wl) this.watchlist = wl.filter((w) => w.enabled)
-    if (rules) this.rules = rules
+    const [remoteWatch, remoteRules, chats] = convex.configured
+      ? await Promise.all([convex.listWatchlist(), convex.listRules(), convex.listChats()])
+      : [null, null, null]
+    this.watchlist = (remoteWatch ?? this.store.getState<WatchRow[]>('watchlist', [])).filter((row) => row.enabled)
+    this.rules = remoteRules ?? this.store.getState<AlertRuleRow[]>('alert_rules', [])
     if (chats) {
       this.chats = chats.map((c) => c.chatId)
       this.mutedChats = new Set(chats.filter((c) => c.muted).map((c) => c.chatId))
@@ -304,58 +332,77 @@ export class Runtime {
   }
 
   async updateSettings(patch: Record<string, unknown>) {
-    await convex.updateSettings(patch)
-    await this.refreshSettings()
+    this.settings = {
+      ...this.settings,
+      ...patch,
+      weights: { ...this.settings.weights, ...((patch.weights as Record<string, number> | undefined) ?? {}) },
+      ai: { ...this.settings.ai, ...((patch.ai as Partial<AiConfig> | undefined) ?? {}) },
+      scanner: { ...this.settings.scanner, ...((patch.scanner as Partial<RuntimeSettings['scanner']> | undefined) ?? {}) },
+      telegram: { ...this.settings.telegram, ...((patch.telegram as Partial<RuntimeSettings['telegram']> | undefined) ?? {}) },
+    }
+    this.store.setState('settings', this.settings)
+    if (convex.configured) await convex.updateSettings(patch)
     this.syncSubscriptions()
     return this.settings
   }
 
-  /** First-run experience: a useful watchlist and sane alert rules. */
+  /** First-run experience: a liquid crypto research universe and sane alert rules. */
   private async seedDefaults() {
-    if (!convex.configured) return
     if (!this.watchlist.length) {
-      const seed = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'SOL-USDT-SWAP', 'NVDA-USDT-SWAP']
+      const seed = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT', 'DOGE-USDT', 'ADA-USDT', 'AVAX-USDT', 'LINK-USDT']
       for (const instId of seed) {
         const spec = this.universe.get(instId)
         if (!spec) continue
-        await convex.addWatch(instId, spec.instType, this.settings.timeframe, 'seeded on first run')
+        await this.addWatch(instId, spec.instType, this.settings.timeframe, 'liquidity-ranked default universe')
       }
-      log.info('boot', `seeded watchlist with ${seed.length} instruments`)
+      log.info('boot', `seeded research watchlist with ${this.watchlist.length} instruments`)
     }
     if (!this.rules.length) {
-      await convex.upsertRule({
-        name: 'Actionable setup on watchlist',
-        scope: '*',
-        type: 'signal',
-        timeframe: 'any',
-        params: { threshold: 65, direction: 'any' },
-        cooldownMs: 30 * 60_000,
-        telegram: true,
-        enabled: true,
+      await this.upsertAlertRule({
+        name: 'Evidence-backed paper candidate', scope: '*', type: 'signal', timeframe: 'any',
+        params: { threshold: 65, direction: 'any' }, cooldownMs: 30 * 60_000,
+        telegram: false, enabled: true,
       })
-      await convex.upsertRule({
-        name: 'Volatility squeeze fires',
-        scope: '*',
-        type: 'squeeze_fire',
-        timeframe: 'any',
-        params: {},
-        cooldownMs: 45 * 60_000,
-        telegram: true,
-        enabled: true,
-      })
-      await convex.upsertRule({
-        name: 'Funding extreme (crowded book)',
-        scope: '*',
-        type: 'funding_extreme',
-        timeframe: 'any',
-        params: { threshold: 45 },
-        cooldownMs: 6 * 60 * 60_000,
-        telegram: true,
-        enabled: true,
-      })
-      log.info('boot', 'seeded 3 default alert rules')
+      log.info('boot', 'seeded local alert rule')
     }
-    await this.refreshSettings()
+  }
+
+  async addWatch(instId: string, instType: string, timeframe: string, note?: string) {
+    const existing = this.watchlist.find((row) => row.instId === instId)
+    if (existing) Object.assign(existing, { instType, timeframe, note, enabled: true })
+    else this.watchlist.push({ _id: `local:${instId}`, instId, instType, timeframe, enabled: true, alertsEnabled: true, note, addedAt: Date.now() })
+    this.store.setState('watchlist', this.watchlist)
+    if (convex.configured) await convex.addWatch(instId, instType, timeframe, note)
+  }
+
+  async removeWatch(instId: string) {
+    this.watchlist = this.watchlist.filter((row) => row.instId !== instId)
+    this.store.setState('watchlist', this.watchlist)
+    if (convex.configured) await convex.removeWatch(instId)
+  }
+
+  async patchWatch(instId: string, patch: Partial<WatchRow>) {
+    const row = this.watchlist.find((item) => item.instId === instId)
+    if (row) Object.assign(row, patch)
+    this.store.setState('watchlist', this.watchlist)
+    if (convex.configured) await convex.patchWatch(instId, patch)
+  }
+
+  async upsertAlertRule(rule: Omit<AlertRuleRow, '_id' | 'lastFiredAt' | 'firedCount' | 'createdAt'> & { id?: string }) {
+    const id = rule.id ?? `local:${Date.now()}:${Math.random().toString(36).slice(2)}`
+    const existing = this.rules.find((item) => item._id === id)
+    const row: AlertRuleRow = { ...rule, _id: id, lastFiredAt: existing?.lastFiredAt ?? 0, firedCount: existing?.firedCount ?? 0, createdAt: existing?.createdAt ?? Date.now() }
+    delete (row as AlertRuleRow & { id?: string }).id
+    this.rules = [...this.rules.filter((item) => item._id !== id), row]
+    this.store.setState('alert_rules', this.rules)
+    if (convex.configured) await convex.upsertRule({ ...rule, id })
+    return id
+  }
+
+  async deleteAlertRule(id: string) {
+    this.rules = this.rules.filter((rule) => rule._id !== id)
+    this.store.setState('alert_rules', this.rules)
+    if (convex.configured) await convex.deleteRule(id)
   }
 
   /* ---- market data ----------------------------------------------------- */
@@ -452,6 +499,8 @@ export class Runtime {
       useDerivatives: s.useDerivatives,
       useEmpiricalEdge: s.useEmpiricalEdge,
       takerFeeBps: s.takerFeeBps,
+      maxOpenPositions: s.maxOpenPositions,
+      maxDailyLossPct: s.maxDailyLossPct,
       useAccountBalance: s.useAccountBalance,
       maxAtrPct: s.maxAtrPct,
       minAdx: s.minAdx,
@@ -517,10 +566,13 @@ export class Runtime {
 
     /* ---- AI arbitration, strictly gated ------------------------------- */
     const ai = this.settings.ai
+    const aiUsage = this.store.aiUsageThisMonth()
+    const aiBudgetOk = aiUsage.spend < Math.max(0, this.settings.aiMonthlyBudgetEur)
     const hardVeto = analysis.vetoes.some((v) => v.severity === 'hard')
     const wantAi =
       (opts.withAi ?? true) &&
       ai.enabled &&
+      aiBudgetOk &&
       this.gemini.configured &&
       analysis.decision !== 'WAIT' &&
       analysis.conviction >= ai.minConvictionToAsk &&
@@ -533,6 +585,7 @@ export class Runtime {
         const opinion = await this.gemini.decide(analysis, { ...ai, model: ai.model })
         if (opinion) {
           analysis.ai = opinion
+          this.store.recordAiUsage(opinion.model, opinion.tokensIn, opinion.tokensOut, (opinion.tokensIn * 0.3 + opinion.tokensOut * 2.5) / 1_000_000)
           if (!opinion.cached) {
             log.ai(
               'gemini',
@@ -591,7 +644,7 @@ export class Runtime {
         delivered = (await this.bot.broadcast(this.activeChats(), html)) > 0
       }
       log.alert('alerts', `${c.title} — ${c.message}`, { instId: a.instId, timeframe: a.timeframe })
-      await convex.recordAlert({
+      const alertRecord = {
         ruleId: c.ruleId,
         ruleName: c.ruleName,
         type: c.type,
@@ -605,11 +658,18 @@ export class Runtime {
         price: c.price,
         payload: JSON.stringify(a.compact).slice(0, 3500),
         telegramDelivered: delivered,
-      })
+        ts: Date.now(),
+      }
+      this.store.recordAlert(alertRecord)
+      if (convex.configured) await convex.recordAlert(alertRecord)
       if (c.ruleId) {
-        await convex.markRuleFired(c.ruleId, Date.now())
+        if (convex.configured) await convex.markRuleFired(c.ruleId, Date.now())
         const rule = this.rules.find((r) => r._id === c.ruleId)
-        if (rule) rule.lastFiredAt = Date.now()
+        if (rule) {
+          rule.lastFiredAt = Date.now()
+          rule.firedCount++
+          this.store.setState('alert_rules', this.rules)
+        }
       }
     }
 
@@ -617,24 +677,85 @@ export class Runtime {
   }
 
   private async maybeJournal(a: Analysis) {
+    const featureTime = a.generatedAt - Math.max(0, a.dataQuality.staleMs)
+    const policyVersion = 'explicit-playbooks-v1'
+    const decisionId = `${a.instId}:${a.timeframe}:${featureTime}`
+    this.store.recordDecision(decisionId, a, policyVersion, this.store.researchState().champion ? 'paper-champion' : 'NO_VALIDATED_MODEL')
+
+    const candidates = evaluateStrategies(a)
+    this.latestCandidates.set(this.key(a.instId, a.timeframe), candidates)
+    for (const candidate of candidates) {
+      this.store.recordCandidate({
+        id: `${a.instId}:${a.timeframe}:${featureTime}:${candidate.playbook}:${candidate.side}`,
+        observedAt: a.generatedAt,
+        instId: a.instId,
+        timeframe: a.timeframe,
+        playbook: candidate.playbook,
+        side: candidate.side,
+        eligible: candidate.eligible,
+        reasons: candidate.rejectionReasons,
+        policyVersion,
+        featureTime,
+        latestSourceTime: featureTime,
+        availableAt: a.generatedAt,
+        payload: candidate,
+      })
+    }
+
+    if (this.paperKillSwitch) return
     if (a.decision === 'WAIT' || !a.plan) return
-    if (a.conviction < this.settings.minConfidence) return
+    if (a.conviction < this.settings.minConfidence || a.plan.netExpectancyR <= 0) return
     if (a.vetoes.some((v) => v.severity === 'hard')) return
-    const live = (await convex.listLiveSignals()) ?? []
-    const dup = live.find(
-      (s) => s.instId === a.instId && s.timeframe === a.timeframe && s.decision === a.decision,
-    )
-    if (dup) return
-    const record = toSignalRecord(a)
-    if (!record) return
-    const id = await convex.recordSignal(record)
-    if (id) {
+    const selected = candidates.find((candidate) => candidate.eligible && candidate.side === a.decision)
+    if (!selected) return
+    const active = [...this.paperTrades.values()].filter((trade) => trade.status === 'pending' || trade.status === 'open')
+    if (active.some((trade) => trade.plan.instId === a.instId && trade.plan.timeframe === a.timeframe && trade.plan.side === a.decision)) return
+
+    const plan = createPaperPlan({
+      id: `paper:${decisionId}:${selected.playbook}`,
+      instId: a.instId,
+      timeframe: a.timeframe,
+      signalAt: a.generatedAt,
+      playbook: selected.playbook,
+      policyVersion,
+      modelVersion: this.store.researchState().champion ? 'paper-champion' : 'heuristic-baseline',
+      plan: a.plan,
+      atrAtEntry: a.indicators.volatility.atr,
+      feeBps: this.settings.takerFeeBps,
+      fundingRate8h: a.derivatives?.fundingRate ?? undefined,
+    })
+    const today = new Date(); today.setUTCHours(0, 0, 0, 0)
+    const realizedDailyR = this.store.listTrades(1000).filter((trade) => (trade.closedAt ?? 0) >= today.getTime()).reduce((sum, trade) => sum + trade.netRealizedR, 0)
+    const risk = assessPaperRisk(plan, {
+      equityUsd: this.settings.equityUsd,
+      openRiskUsd: active.reduce((sum, trade) => sum + trade.plan.riskUsd * trade.remaining, 0),
+      openNotionalUsd: active.reduce((sum, trade) => sum + trade.plan.quantity * trade.plan.entry * trade.remaining, 0),
+      realizedDailyR,
+      openTrades: active,
+    }, {
+      ...DEFAULT_RISK_POLICY,
+      maxOpenPositions: this.settings.maxOpenPositions,
+      maxDailyLossR: this.settings.maxDailyLossPct,
+      maxOpenRiskPct: this.settings.maxOpenRiskPct,
+      maxGrossExposurePct: this.settings.maxGrossExposurePct,
+    })
+    let trade = submitPaperPlan(plan)
+    if (!risk.allowed) {
+      trade.status = 'rejected'
+      trade.exitReason = 'risk_rejected'
+      trade.closedAt = Date.now()
+      trade.events.push({ at: Date.now(), type: 'rejected', detail: risk.reasons.join(', ') })
+    } else {
+      this.paperTrades.set(trade.id, trade)
       this.counters.signals++
-      log.signal(
-        'journal',
-        `logged ${a.decision} ${a.instId} ${a.timeframe} @ ${fmtPrice(a.price)} · conviction ${a.conviction.toFixed(0)} · ${a.plan.expectedRr.toFixed(2)}R`,
-        { instId: a.instId, timeframe: a.timeframe },
-      )
+      log.signal('paper', `armed ${a.decision} ${a.instId} ${a.timeframe} for paper validation only`, { instId: a.instId, timeframe: a.timeframe })
+    }
+    this.store.saveTrade(trade)
+    this.store.setState('last_risk_decision', risk)
+
+    if (convex.configured) {
+      const record = toSignalRecord(a)
+      if (record) await convex.recordSignal(record)
     }
   }
 
@@ -741,25 +862,38 @@ export class Runtime {
     return out
   }
 
-  private async journalLoop() {
-    const live = (await convex.listLiveSignals()) ?? []
-    for (const s of live as SignalRow[]) {
-      const candles = candleStore.peek(s.instId, s.timeframe) ?? (await candleStore.ensure(s.instId, s.timeframe, 200))
-      const lastPrice = this.tickers.get(s.instId)?.last ?? candles[candles.length - 1]?.close ?? s.lastPrice
-      const graded = gradeSignal(s, candles, lastPrice)
-      if (!graded) continue
-      await convex.gradeSignal(s._id, graded.patch)
-      if (graded.closed) {
-        log.signal('journal', graded.headline, { instId: s.instId, timeframe: s.timeframe })
-        if (this.settings.telegram.enabled) {
-          const realized = Number(graded.patch.realizedR ?? 0)
-          await this.bot.broadcast(
-            this.activeChats(),
-            `${realized >= 0 ? '\u2705' : '\u274C'} <b>Idea closed</b>\n<code>${s.instId}</code> ${s.timeframe} ${s.decision}\n${graded.headline}`,
-          )
-        }
+  private async paperLoop() {
+    for (const [id, existing] of this.paperTrades) {
+      if (existing.status !== 'pending' && existing.status !== 'open') continue
+      const candles = candleStore.peek(existing.plan.instId, existing.plan.timeframe)
+        ?? (await candleStore.ensure(existing.plan.instId, existing.plan.timeframe, 300))
+      let trade = existing
+      let changed = false
+      for (const candle of candles) {
+        const result = processPaperBar(trade, candle)
+        trade = result.trade
+        changed ||= result.changed
+        if (trade.status === 'closed' || trade.status === 'expired' || trade.status === 'rejected') break
+      }
+      if (!changed) continue
+      this.paperTrades.set(id, trade)
+      this.store.saveTrade(trade)
+      if (trade.status === 'closed' || trade.status === 'expired') {
+        log.signal('paper', `${trade.plan.instId} ${trade.plan.side} ${trade.exitReason} ${trade.netRealizedR >= 0 ? '+' : ''}${trade.netRealizedR.toFixed(2)}R net`, { instId: trade.plan.instId, timeframe: trade.plan.timeframe })
       }
     }
+  }
+
+  private maintenanceLoop() {
+    const keep = new Set([this.settings.instId, ...this.watchlist.map((row) => row.instId)])
+    candleStore.evict(keep)
+    this.store.pruneCandles(Date.now() - 365 * 24 * 60 * 60_000)
+    this.store.checkpoint()
+  }
+
+  /** Legacy Convex journal is retained read-only; SQLite paper events are the execution truth. */
+  private async journalLoop() {
+    return
   }
 
   private async telemetryLoop() {
@@ -945,6 +1079,9 @@ export class Runtime {
 
   health() {
     const wsHealth = this.stream.health()
+    const research = this.store.researchState()
+    const aiUsage = this.store.aiUsageThisMonth()
+    const rssMb = process.memoryUsage().rss / 1024 / 1024
     return {
       ok: true,
       startedAt: this.startedAt,
@@ -955,9 +1092,13 @@ export class Runtime {
       memory: candleStore.stats(),
       ws: wsHealth,
       rest: { ...restStats },
-      ai: this.gemini.stats(),
+      ai: { ...this.gemini.stats(), monthlySpendEur: aiUsage.spend, monthlyBudgetEur: this.settings.aiMonthlyBudgetEur, budgetBlocked: aiUsage.spend >= this.settings.aiMonthlyBudgetEur },
       telegram: { ...this.bot.stats(), chats: this.chats.length, muted: this.mutedChats.size },
       convex: convex.health,
+      localStore: this.store.summary(),
+      paper: { ...this.store.paperStats(), active: this.store.loadActiveTrades().length, killSwitch: this.paperKillSwitch },
+      research: { validationState: research.validationState, governor: this.research.governor(), champion: research.champion },
+      resources: { rssMb, freeMemoryMb: freemem() / 1024 / 1024, totalMemoryMb: totalmem() / 1024 / 1024, load1: loadavg()[0] },
       counters: this.counters,
       scanner: { at: this.scan.at, scanned: this.scan.scanned, running: this.scan.running },
       account: this.account,
@@ -969,6 +1110,7 @@ export class Runtime {
   stop() {
     this.stream.close()
     this.bot.stop()
+    this.store.close()
   }
 }
 

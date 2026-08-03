@@ -199,7 +199,8 @@ export function DecisionCard({
               />
             ))}
             <Row label="blended R:R" value={`${shown.expectedRr.toFixed(2)}R`} />
-            <Row label="win probability" value={`${(shown.winProbability * 100).toFixed(0)}%`} />
+            <Row label="scenario win estimate" value={`${(shown.winProbability * 100).toFixed(0)}%`} hint={shown.probabilityBasis === 'heuristic_scenario_not_calibrated' ? 'unvalidated' : `${shown.edgeSample} analogues`} />
+            <Row label="validation state" value={shown.validationState.replace(/_/g, ' ')} tone="warning" mono={false} />
             <Row label="expectancy (gross)" value={fmtR(shown.expectancyR)} />
             <Row label="expectancy (net of costs)" value={fmtR(shown.netExpectancyR)} tone={shown.netExpectancyR > 0 ? 'bull' : 'warning'} />
           </div>

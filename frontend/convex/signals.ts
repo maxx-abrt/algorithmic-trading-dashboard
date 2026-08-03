@@ -21,12 +21,13 @@ export const stats = query({
   args: {},
   handler: async (ctx) => {
     const rows = await ctx.db.query('signals').withIndex('by_createdAt').order('desc').take(400)
-    const closed = rows.filter((r) => r.status !== 'live' && typeof r.realizedR === 'number')
+    const open = rows.filter((r) => r.status === 'live' || r.status === 'tp1')
+    const closed = rows.filter((r) => r.status !== 'live' && r.status !== 'tp1' && typeof r.realizedR === 'number')
     const wins = closed.filter((r) => (r.realizedR ?? 0) > 0)
     const sumR = closed.reduce((s, r) => s + (r.realizedR ?? 0), 0)
     return {
       total: rows.length,
-      live: rows.filter((r) => r.status === 'live').length,
+      live: open.length,
       closed: closed.length,
       winRate: closed.length ? (wins.length / closed.length) * 100 : 0,
       avgR: closed.length ? sumR / closed.length : 0,
@@ -48,11 +49,10 @@ export const record = mutation({
 
 export const listLive = query({
   args: {},
-  handler: async (ctx) =>
-    await ctx.db
-      .query('signals')
-      .withIndex('by_status', (q) => q.eq('status', 'live'))
-      .take(100),
+  handler: async (ctx) => {
+    const rows = await ctx.db.query('signals').withIndex('by_createdAt').order('desc').take(300)
+    return rows.filter((row) => row.status === 'live' || row.status === 'tp1').slice(0, 100)
+  },
 })
 
 export const grade = mutation({
