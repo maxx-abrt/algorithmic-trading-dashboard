@@ -73,6 +73,8 @@ export interface RuntimeSettings {
   maxOpenRiskPct: number
   maxGrossExposurePct: number
   aiMonthlyBudgetEur: number
+  autoResearchEnabled: boolean
+  researchIntervalHours: number
   ai: AiConfig
   scanner: {
     enabled: boolean
@@ -122,6 +124,8 @@ export const FALLBACK_SETTINGS: RuntimeSettings = {
   maxOpenRiskPct: 3,
   maxGrossExposurePct: 150,
   aiMonthlyBudgetEur: 10,
+  autoResearchEnabled: true,
+  researchIntervalHours: 24,
   ai: {
     enabled: true,
     model: ENV.gemini.model,
@@ -295,6 +299,7 @@ export class Runtime {
     every(20_000, () => this.journalLoop(), 'journal-mirror')
     every(10_000, () => this.paperLoop(), 'paper-broker')
     every(10 * 60_000, () => this.maintenanceLoop(), 'maintenance')
+    every(30 * 60_000, () => this.autoResearchLoop(), 'auto-research')
     every(30_000, () => this.telemetryLoop(), 'telemetry')
     every(5_000, () => log.flush(), 'logflush')
     every(60_000, () => this.refreshAccount(), 'account')
@@ -889,6 +894,22 @@ export class Runtime {
     candleStore.evict(keep)
     this.store.pruneCandles(Date.now() - 365 * 24 * 60 * 60_000)
     this.store.checkpoint()
+  }
+
+  private async autoResearchLoop() {
+    if (!this.settings.engineEnabled || !this.settings.autoResearchEnabled) return
+    const state = this.store.researchState()
+    const latest = state.campaigns.reduce((max, campaign) => Math.max(max, Number(campaign.created_at ?? 0)), 0)
+    const intervalMs = Math.max(6, this.settings.researchIntervalHours) * 60 * 60_000
+    if (latest && Date.now() - latest < intervalMs) return
+    const governor = this.research.governor()
+    if (!governor.allowed) return
+    log.info('research', 'starting scheduled BTC/ETH walk-forward campaign')
+    const result = await this.research.run({
+      symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'], timeframe: '15m', maxEvaluations: 24,
+      hypothesis: 'Scheduled confirmation: explicit playbooks retain positive net R across purged folds and held-out ETH.',
+    })
+    log.info('research', `scheduled campaign ${result.status}: ${result.validationState}`)
   }
 
   /** Legacy Convex journal is retained read-only; SQLite paper events are the execution truth. */

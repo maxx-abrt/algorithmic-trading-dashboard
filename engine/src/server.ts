@@ -283,7 +283,11 @@ const routes: Record<string, Handler> = {
     return { enabled: runtime.paperKillSwitch, note: 'Paper candidate arming only; no exchange orders exist' }
   },
 
-  'GET /api/research': () => ({ ...runtime.store.researchState(), governor: runtime.research.governor() }),
+  'GET /api/research': () => ({
+    ...runtime.store.researchState(),
+    governor: runtime.research.governor(),
+    schedule: { enabled: runtime.settings.autoResearchEnabled, intervalHours: runtime.settings.researchIntervalHours },
+  }),
 
   'POST /api/research/run': async (req) => {
     const body = await readBody(req)

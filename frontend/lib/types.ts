@@ -305,6 +305,8 @@ export interface EngineSettings {
   maxOpenRiskPct: number
   maxGrossExposurePct: number
   aiMonthlyBudgetEur: number
+  autoResearchEnabled: boolean
+  researchIntervalHours: number
   ai: {
     enabled: boolean
     model: string
@@ -522,6 +524,7 @@ export interface ResearchState {
   validationState: string
   champion: Record<string, unknown> | null
   governor: { allowed: boolean; reasons: string[]; rssMb: number; load1: number; maxRssMb: number; maxLoad: number; running: boolean }
+  schedule: { enabled: boolean; intervalHours: number }
   campaigns: Record<string, unknown>[]
   trials: { id: string; campaign_id: string; created_at: number; status: string; config_hash: string; metrics_json: Record<string, number | null | number[]> }[]
   models: { id: string; created_at: number; state: string; strategy: string; version: string; metrics_json: Record<string, unknown>; rollback_reason?: string }[]

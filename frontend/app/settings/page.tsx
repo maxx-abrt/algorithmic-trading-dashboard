@@ -149,6 +149,7 @@ export default function SettingsPage() {
                     label="empirical edge back-scan"
                   />
                   <Switch checked={s.engineEnabled} onChange={(v) => set({ engineEnabled: v })} label="engine running" />
+                  <Switch checked={s.autoResearchEnabled} onChange={(v) => set({ autoResearchEnabled: v })} label="scheduled local research campaigns" />
                 </div>
               </div>
             </TabPanel>
@@ -302,6 +303,9 @@ export default function SettingsPage() {
                 </Field>
                 <Field label="minimum 24h turnover (USD)">
                   <NumberInput value={s.scanner.minVol24hUsd} onChangeValue={(v) => set({ scanner: { ...s.scanner, minVol24hUsd: v } })} />
+                </Field>
+                <Field label="scheduled research interval (hours)" hint="minimum 6 hours; resource governor may defer a run">
+                  <NumberInput value={s.researchIntervalHours} min={6} max={168} onChangeValue={(v) => set({ researchIntervalHours: Math.max(6, v) })} />
                 </Field>
                 <Field label={`universe size · ${s.scanner.universeSize}`} hint="deep-scanned instruments per cycle">
                   <Slider value={s.scanner.universeSize} min={10} max={200} step={5} onChange={(v) => set({ scanner: { ...s.scanner, universeSize: v } })} />
