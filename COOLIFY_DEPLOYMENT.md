@@ -17,7 +17,10 @@ There is no trade service and no OKX private credential requirement.
    - `GEMINI_MODEL` (default `gemini-2.5-flash`)
    - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` only if notifications are wanted
 5. Leave all `OKX_API_*` variables unset. Public market data needs no credentials and the codebase has no order endpoint.
-6. If you deploy the services as individual Nixpacks applications instead of Docker Compose, the `package.json` `engines.node` and `.nvmrc` files are set to `22`, so Nixpacks will use Node 22 and the build will no longer fall back to EOL Node 18.
+6. If you deploy the services as individual Nixpacks applications instead of Docker Compose:
+   - `engine/nixpacks.toml` and `frontend/nixpacks.toml` pin the nixpkgs archive that ships Node 22.13.1, which also satisfies `vite@7.3.6`'s `>=22.12.0` requirement.
+   - `engine/nixpacks.toml` installs `python3`, `make`, and `g++` so `better-sqlite3` can be compiled from source if a prebuilt binary is not available.
+   - `package.json` `engines.node` and `.nvmrc` are set to `>=22.0.0` / `22` respectively as a fallback; you can additionally set the Coolify environment variable `NIXPACKS_NODE_VERSION=22` if your Coolify/Nixpacks version ignores those signals.
 7. Deploy, then verify:
    - `/api/health` returns `ok: true`
    - `ws.public.healthy` and `ws.business.healthy` are true after warm-up
