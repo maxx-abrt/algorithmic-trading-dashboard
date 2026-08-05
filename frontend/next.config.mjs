@@ -8,7 +8,8 @@ const ENGINE_ORIGIN = process.env.ENGINE_ORIGIN || 'http://127.0.0.1:8790'
 
 const nextConfig = {
   reactStrictMode: false,
-  typescript: { ignoreBuildErrors: true },
+  typescript: { ignoreBuildErrors: false },
+  turbopack: { root: new URL('.', import.meta.url).pathname },
   images: { unoptimized: true },
   async rewrites() {
     return [{ source: '/api/:path*', destination: `${ENGINE_ORIGIN}/api/:path*` }]

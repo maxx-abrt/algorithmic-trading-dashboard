@@ -86,20 +86,22 @@ export function StatusBar() {
           data-testid="status-ai"
           title={data?.ai.lastError || 'Gemini arbitration cost'}
         >
-          ai <span className="num">{data?.ai.calls ?? 0}</span> calls
-          <span className="num text-muted-foreground">
-            {((data?.ai.tokensIn ?? 0) + (data?.ai.tokensOut ?? 0)).toLocaleString('en-US')} tok
-          </span>
+          ai <span className="num">€{data?.ai.monthlySpendEur.toFixed(3) ?? '0.000'}</span>
+          <span className="num text-muted-foreground">/ €{data?.ai.monthlyBudgetEur.toFixed(0) ?? '10'}</span>
           {Boolean(data?.ai.cacheHits) && <span className="num text-bull">{data?.ai.cacheHits} cached</span>}
         </Chip>
 
         <Chip
-          tone={data?.convex.status === 'online' ? 'neutral' : 'warning'}
-          data-testid="status-convex"
-          title={data?.convex.lastError || 'Convex system of record'}
+          tone="neutral"
+          data-testid="status-local-store"
+          title="SQLite WAL local truth store"
         >
-          <Dot tone={data?.convex.status === 'online' ? 'bull' : 'warning'} />
-          convex <span className="num">{data?.convex.writes ?? 0}w</span>
+          <Dot tone="bull" />
+          sqlite <span className="num">{data?.localStore.paperEvents ?? 0} events</span>
+        </Chip>
+
+        <Chip tone={data?.research.validationState === 'VALIDATED' ? 'bull' : 'warning'} data-testid="status-model-validation">
+          {data?.research.validationState ?? 'NO_VALIDATED_MODEL'}
         </Chip>
 
         <Chip

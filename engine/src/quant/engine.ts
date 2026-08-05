@@ -598,24 +598,53 @@ export function analyze(input: AnalyzeInput): Analysis {
   const side: 'LONG' | 'SHORT' = comp1 >= 0 ? 'LONG' : 'SHORT'
 
   /* ---- pass 2: back-scan the exact idea, then re-score ----------------- */
-  const provisionalPlaybook = selectPlaybook(indicators, side, settings)
-  const edge: EdgeBlock | null =
+  let edgePlaybook = selectPlaybook(indicators, side, settings)
+  let edge: EdgeBlock | null =
     settings.useEmpiricalEdge && ltf.length >= 140
       ? computeEdge({
           candles: ltf,
           side,
-          stopAtr: stopAtrMultiplier(indicators, provisionalPlaybook),
+          stopAtr: stopAtrMultiplier(indicators, edgePlaybook),
           targetR: clamp(settings.rrRatio, 1.2, 6),
-          horizonBars: timeStop(provisionalPlaybook),
+          horizonBars: timeStop(edgePlaybook),
         })
       : null
 
-  const factors = edge
+  let factors = edge
     ? [...baseFactors, edgeFactor(edge, side, indicators.volatility.regime, settings)]
     : baseFactors
-  const comp = composite(factors)
+  let comp = composite(factors)
   const alignment = mtfAlignment(allTf)
-  const finalSide: 'LONG' | 'SHORT' = comp >= 0 ? 'LONG' : 'SHORT'
+  let finalSide: 'LONG' | 'SHORT' = comp >= 0 ? 'LONG' : 'SHORT'
+
+  // Edge statistics are side-specific. If they flip the initial side, recompute
+  // against that new side. If the result oscillates, discard the empirical
+  // factor rather than attaching LONG evidence to a SHORT decision (or inverse).
+  if (edge && finalSide !== side) {
+    const recomputedPlaybook = selectPlaybook(indicators, finalSide, settings)
+    const recomputedEdge = computeEdge({
+      candles: ltf,
+      side: finalSide,
+      stopAtr: stopAtrMultiplier(indicators, recomputedPlaybook),
+      targetR: clamp(settings.rrRatio, 1.2, 6),
+      horizonBars: timeStop(recomputedPlaybook),
+    })
+    const recomputedFactors = [...baseFactors, edgeFactor(recomputedEdge, finalSide, indicators.volatility.regime, settings)]
+    const recomputedComposite = composite(recomputedFactors)
+    const stableSide: 'LONG' | 'SHORT' = recomputedComposite >= 0 ? 'LONG' : 'SHORT'
+    if (stableSide === finalSide) {
+      edge = recomputedEdge
+      edgePlaybook = recomputedPlaybook
+      factors = recomputedFactors
+      comp = recomputedComposite
+    } else {
+      edge = null
+      factors = baseFactors
+      comp = comp1
+      finalSide = side
+      edgePlaybook = selectPlaybook(indicators, side, settings)
+    }
+  }
 
   const vetoes = buildVetoes({
     indicators,
@@ -629,7 +658,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     session,
     edge,
     volUsd24h: input.volUsd24h ?? null,
-    playbook: provisionalPlaybook,
+    playbook: edgePlaybook,
   })
 
   // Confluence bonuses: a proven historical edge and a freshly confirmed
@@ -640,7 +669,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     (leadPattern ? 4 : 0) +
     (indicators.divergences.some((d) => d.side === finalSide && d.kind === 'regular' && d.barsAgo <= 4) ? 3 : 0)
 
-  const { decision, conviction: rawConviction } = decide({
+  const decisionResult = decide({
     composite: comp,
     alignment,
     factors,
@@ -648,6 +677,8 @@ export function analyze(input: AnalyzeInput): Analysis {
     settings,
     bonus,
   })
+  let decision = decisionResult.decision
+  const rawConviction = decisionResult.conviction
   // Illiquid sessions can never produce a high-conviction print.
   const conviction = clamp(rawConviction * (session.isEquity ? session.liquidityFactor * 0.35 + 0.65 : 1), 0, 100)
 
@@ -668,6 +699,10 @@ export function analyze(input: AnalyzeInput): Analysis {
     availableUsd: input.availableUsd ?? null,
     barMinutes: barMinutes(tf),
   })
+  if (decision !== 'WAIT' && candidatePlan.netExpectancyR <= 0) {
+    vetoes.push({ id: 'non_positive_net_expectancy', reason: `Plan expectancy is ${candidatePlan.netExpectancyR.toFixed(2)}R after estimated costs`, severity: 'hard' })
+    decision = 'WAIT'
+  }
   // On WAIT the plan is deliberately not actionable, but the operator still wants
   // to know *where* the trade would live if the tape confirmed.
   const plan = decision === 'WAIT' ? null : candidatePlan

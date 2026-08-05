@@ -62,7 +62,7 @@ export default function SettingsPage() {
       <Panel
         className="xl:col-span-8"
         title="Engine configuration"
-        subtitle="every change is written to Convex and applied by the running engine immediately"
+        subtitle="changes are persisted locally in SQLite and applied by the running engine immediately"
         actions={
           <Button size="sm" variant="primary" onClick={() => void save(s)} disabled={busy} data-testid="settings-save-button">
             {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
@@ -149,6 +149,7 @@ export default function SettingsPage() {
                     label="empirical edge back-scan"
                   />
                   <Switch checked={s.engineEnabled} onChange={(v) => set({ engineEnabled: v })} label="engine running" />
+                  <Switch checked={s.autoResearchEnabled} onChange={(v) => set({ autoResearchEnabled: v })} label="scheduled local research campaigns" />
                 </div>
               </div>
             </TabPanel>
@@ -170,7 +171,19 @@ export default function SettingsPage() {
                 <Field label="taker fee (bps)" hint="OKX perp taker is 5bps by default">
                   <NumberInput value={s.takerFeeBps} onChangeValue={(v) => set({ takerFeeBps: v })} />
                 </Field>
-                <Field label="read-only OKX balance" hint={health.data?.okxKeys ? 'API keys detected' : 'no API keys configured'}>
+                <Field label="maximum open paper positions">
+                  <NumberInput value={s.maxOpenPositions} min={1} max={10} onChangeValue={(v) => set({ maxOpenPositions: v })} />
+                </Field>
+                <Field label="daily paper loss kill (R)">
+                  <NumberInput value={s.maxDailyLossPct} min={0.5} max={20} step={0.5} onChangeValue={(v) => set({ maxDailyLossPct: v })} />
+                </Field>
+                <Field label="maximum open risk (% equity)">
+                  <NumberInput value={s.maxOpenRiskPct} min={0.5} max={20} step={0.5} onChangeValue={(v) => set({ maxOpenRiskPct: v })} />
+                </Field>
+                <Field label="maximum gross paper exposure (%)">
+                  <NumberInput value={s.maxGrossExposurePct} min={10} max={500} step={10} onChangeValue={(v) => set({ maxGrossExposurePct: v })} />
+                </Field>
+                <Field label="read-only OKX balance" hint={health.data?.okxKeys ? 'API keys detected' : 'not required for paper research'}>
                   <Switch
                     checked={s.useAccountBalance}
                     onChange={(v) => set({ useAccountBalance: v })}
@@ -241,6 +254,9 @@ export default function SettingsPage() {
                     onChangeValue={(v) => set({ ai: { ...s.ai, cooldownMs: Math.max(15, v) * 1000 } })}
                   />
                 </Field>
+                <Field label="monthly AI budget (EUR)" hint="hard circuit breaker across manual and automatic calls">
+                  <NumberInput value={s.aiMonthlyBudgetEur} min={0} max={10} step={0.5} onChangeValue={(v) => set({ aiMonthlyBudgetEur: Math.min(10, Math.max(0, v)) })} data-testid="settings-ai-budget" />
+                </Field>
                 <Field label="enabled">
                   <Switch checked={s.ai.enabled} onChange={(v) => set({ ai: { ...s.ai, enabled: v } })} label="consult the AI risk officer" />
                 </Field>
@@ -287,6 +303,9 @@ export default function SettingsPage() {
                 </Field>
                 <Field label="minimum 24h turnover (USD)">
                   <NumberInput value={s.scanner.minVol24hUsd} onChangeValue={(v) => set({ scanner: { ...s.scanner, minVol24hUsd: v } })} />
+                </Field>
+                <Field label="scheduled research interval (hours)" hint="minimum 6 hours; resource governor may defer a run">
+                  <NumberInput value={s.researchIntervalHours} min={6} max={168} onChangeValue={(v) => set({ researchIntervalHours: Math.max(6, v) })} />
                 </Field>
                 <Field label={`universe size · ${s.scanner.universeSize}`} hint="deep-scanned instruments per cycle">
                   <Slider value={s.scanner.universeSize} min={10} max={200} step={5} onChange={(v) => set({ scanner: { ...s.scanner, universeSize: v } })} />
@@ -388,8 +407,7 @@ export default function SettingsPage() {
               interest, order book and index prices. No key required for market data.
             </p>
             <p>
-              <Badge tone="info">Convex</Badge> holds settings, watchlist, alert rules and events, the signal journal and
-              telemetry — and pushes them to this UI reactively.
+              <Badge tone="info">SQLite WAL</Badge> is the local source of truth for settings, candidates, paper events, research and operations. Convex is an optional mirror only.
             </p>
             <p>
               <Badge tone="plain">Gemini</Badge> is consulted only when the local stack finds a real setup, with a dense

@@ -365,6 +365,8 @@ export function buildRiskPlan(input: BuildPlanInput): RiskPlan {
     ),
     timeStopBars: bars,
     winProbability,
+    probabilityBasis: empirical != null ? 'empirical_shrunk_with_heuristic_prior' : 'heuristic_scenario_not_calibrated',
+    validationState: edge && edge.sample >= 30 ? 'RESEARCH_CANDIDATE' : 'INSUFFICIENT_EVIDENCE',
     expectancyR,
     kellyFraction,
     feesUsd,

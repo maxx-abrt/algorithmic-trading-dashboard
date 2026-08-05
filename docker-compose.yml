@@ -1,0 +1,57 @@
+services:
+  engine:
+    build:
+      context: ./engine
+    restart: unless-stopped
+    environment:
+      PORT: "8790"
+      MYCROFT_DB_PATH: /app/engine/data/mycroft.sqlite
+      DEFAULT_EQUITY_USD: ${DEFAULT_EQUITY_USD:-10000}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      RESEARCH_MAX_RSS_MB: ${RESEARCH_MAX_RSS_MB:-1400}
+      RESEARCH_MAX_LOAD: ${RESEARCH_MAX_LOAD:-6}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+    volumes:
+      - mycroft-data:/app/engine/data
+      - mycroft-backups:/app/engine/backups
+    expose:
+      - "8790"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8790/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ./frontend
+    restart: unless-stopped
+    environment:
+      ENGINE_ORIGIN: http://engine:8790
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      engine:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  mycroft-data:
+  mycroft-backups:

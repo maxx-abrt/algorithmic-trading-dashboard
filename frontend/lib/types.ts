@@ -51,6 +51,8 @@ export interface RiskPlan {
   invalidation: number
   timeStopBars: number
   winProbability: number
+  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior'
+  validationState: 'INSUFFICIENT_EVIDENCE' | 'RESEARCH_CANDIDATE'
   expectancyR: number
   kellyFraction: number
   feesUsd: number
@@ -298,6 +300,13 @@ export interface EngineSettings {
   equityUsd: number
   useAccountBalance: boolean
   takerFeeBps: number
+  maxOpenPositions: number
+  maxDailyLossPct: number
+  maxOpenRiskPct: number
+  maxGrossExposurePct: number
+  aiMonthlyBudgetEur: number
+  autoResearchEnabled: boolean
+  researchIntervalHours: number
   ai: {
     enabled: boolean
     model: string
@@ -353,9 +362,16 @@ export interface Health {
     lastError: string
     lastCallAt: number
     cacheSize: number
+    monthlySpendEur: number
+    monthlyBudgetEur: number
+    budgetBlocked: boolean
   }
   telegram: { configured: boolean; username: string; sent: number; failed: number; received: number; chats: number; muted: number; lastError: string }
   convex: { configured: boolean; status: string; lastError: string; writes: number; reads: number }
+  localStore: Record<string, number>
+  paper: { total: number; closed: number; open: number; active: number; winRate: number | null; avgR: number | null; sumR: number; killSwitch: boolean }
+  research: { validationState: string; governor: { allowed: boolean; reasons: string[]; rssMb: number; load1: number; running: boolean }; champion: unknown }
+  resources: { rssMb: number; freeMemoryMb: number; totalMemoryMb: number; load1: number }
   counters: { evaluations: number; alerts: number; signals: number; errors: number; wsMessages: number }
   scanner: { at: number; scanned: number; running: boolean }
   account: { totalEquityUsd: number; availableUsdt: number; currencies: { ccy: string; eq: number; availBal: number }[] } | null
@@ -423,6 +439,104 @@ export interface SignalRow {
   aiConfidence?: number
   edgeWinRate?: number
   edgeSample?: number
+}
+
+export interface PaperEvent {
+  at: number
+  type: string
+  price?: number
+  allocation?: number
+  detail: string
+}
+
+export interface PaperTrade {
+  id: string
+  status: 'pending' | 'open' | 'closed' | 'expired' | 'rejected'
+  submittedAt: number
+  filledAt?: number
+  closedAt?: number
+  fillPrice?: number
+  exitPrice?: number
+  exitReason?: string
+  currentStop: number
+  remaining: number
+  barsPending: number
+  barsHeld: number
+  grossRealizedR: number
+  netRealizedR: number
+  feesR: number
+  fundingR: number
+  mfeR: number
+  maeR: number
+  lastProcessedTs: number
+  events: PaperEvent[]
+  targets: { price: number; allocation: number; filled: boolean; filledAt?: number; fillPrice?: number }[]
+  plan: {
+    id: string
+    instId: string
+    timeframe: string
+    side: 'LONG' | 'SHORT'
+    signalAt: number
+    policyVersion: string
+    modelVersion: string
+    playbook: string
+    entry: number
+    entryZone: [number, number]
+    stopLoss: number
+    targets: { price: number; allocation: number }[]
+    quantity: number
+    riskUsd: number
+    maxEntryBars: number
+    maxHoldBars: number
+    feeBps: number
+    slippageBps: number
+  }
+}
+
+export interface PaperState {
+  trades: PaperTrade[]
+  stats: { total: number; closed: number; open: number; winRate: number | null; avgR: number | null; sumR: number; bestR: number | null; worstR: number | null }
+  killSwitch: boolean
+  lastRiskDecision: { allowed: boolean; reasons: string[]; snapshot: Record<string, number> } | null
+  policy: { maxOpenPositions: number; maxDailyLossPct: number; maxOpenRiskPct: number; maxGrossExposurePct: number }
+}
+
+export interface StrategyCandidateRow {
+  id: string
+  observed_at: number
+  inst_id: string
+  timeframe: string
+  playbook: string
+  side: 'LONG' | 'SHORT'
+  eligible: boolean
+  reasons: string[]
+  policy_version: string
+  payload: {
+    score: number
+    prerequisites: string[]
+    triggers: string[]
+    rejectionReasons: string[]
+    invalidation: string
+  }
+}
+
+export interface ResearchState {
+  validationState: string
+  champion: Record<string, unknown> | null
+  governor: { allowed: boolean; reasons: string[]; rssMb: number; load1: number; maxRssMb: number; maxLoad: number; running: boolean }
+  schedule: { enabled: boolean; intervalHours: number }
+  campaigns: Record<string, unknown>[]
+  trials: { id: string; campaign_id: string; created_at: number; status: string; config_hash: string; metrics_json: Record<string, number | null | number[]> }[]
+  models: { id: string; created_at: number; state: string; strategy: string; version: string; metrics_json: Record<string, unknown>; rollback_reason?: string }[]
+}
+
+export interface OperationsState {
+  health: Health
+  qualityEvents: { id: number; observed_at: number; inst_id: string; timeframe: string; kind: string; severity: string; detail: string; repaired_at?: number }[]
+  lastBackup: { destination: string; at: number; pages: number } | null
+  lastParquetExport: { destination: string; at: number; rows: number; instId?: string; timeframe?: string } | null
+  database: { path: string; bytes: number }
+  aiUsage: { spend: number; tokensIn: number; tokensOut: number; calls: number }
 }
 
 export interface LogEntry {

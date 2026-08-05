@@ -17,7 +17,7 @@ export const wipe = mutation({
       while (true) {
         const batch = await ctx.db.query(table as never).take(400)
         if (!batch.length) break
-        for (const row of batch) await ctx.db.delete(row._id)
+        for (const row of batch) await ctx.db.delete((row as unknown as { _id: never })._id)
         deleted += batch.length
         if (batch.length < 400) break
       }

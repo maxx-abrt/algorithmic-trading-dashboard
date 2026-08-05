@@ -9,6 +9,7 @@
 import { fetchCandles } from '../okx/market.js'
 import { barMs, normalizeBar } from '../quant/timeframes.js'
 import type { Candle } from '../quant/types.js'
+import type { DurableStore } from './durable.js'
 
 const MAX_BARS = 600
 const SEED_BARS = 480
@@ -31,6 +32,11 @@ function key(instId: string, bar: string) {
 export class CandleStore {
   private series = new Map<string, Series>()
   private inflight = new Map<string, Promise<Candle[]>>()
+  private durable: DurableStore | null = null
+
+  attachDurableStore(store: DurableStore) {
+    this.durable = store
+  }
 
   size() {
     return this.series.size
@@ -90,6 +96,11 @@ export class CandleStore {
       }
       s.gaps = this.countGaps(s.candles, step)
       this.series.set(k, s)
+      this.durable?.upsertCandles(instId, s.bar, s.candles)
+      if (s.gaps > 0) {
+        this.durable?.recordQualityEvent({ instId, timeframe: s.bar, kind: 'candle_gap', severity: 'warning', detail: `${s.gaps} missing bars detected during seed` })
+        await this.repair(instId, s.bar)
+      }
       return s.candles
     })().finally(() => this.inflight.delete(k))
 
@@ -117,6 +128,7 @@ export class CandleStore {
     }
     s.updatedAt = Date.now()
     s.wsUpdatedAt = Date.now()
+    if (candle.confirmed) this.durable?.upsertCandles(instId, s.bar, [candle])
     return true
   }
 
@@ -133,6 +145,15 @@ export class CandleStore {
     s.gaps = this.countGaps(s.candles, step)
     s.repairs++
     s.updatedAt = Date.now()
+    this.durable?.upsertCandles(instId, s.bar, s.candles)
+    this.durable?.recordQualityEvent({
+      instId,
+      timeframe: s.bar,
+      kind: 'gap_repair',
+      severity: s.gaps === 0 ? 'info' : 'warning',
+      detail: `repair recovered ${before - s.gaps} of ${before} missing bars`,
+      repairedAt: Date.now(),
+    })
     return before - s.gaps
   }
 

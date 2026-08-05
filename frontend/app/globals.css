@@ -34,19 +34,19 @@
 }
 
 :root {
-  --background: oklch(0.16 0.004 285);
-  --foreground: oklch(0.96 0.002 285);
-  --card: oklch(0.195 0.005 285);
-  --card-2: oklch(0.225 0.006 285);
-  --muted: oklch(0.26 0.006 285);
-  --muted-foreground: oklch(0.7 0.008 285);
-  --border: oklch(0.28 0.006 285);
-  --border-strong: oklch(0.36 0.008 285);
+  --background: oklch(0.16 0.004 250);
+  --foreground: oklch(0.96 0.002 250);
+  --card: oklch(0.195 0.005 250);
+  --card-2: oklch(0.225 0.006 250);
+  --muted: oklch(0.26 0.006 250);
+  --muted-foreground: oklch(0.7 0.008 250);
+  --border: oklch(0.28 0.006 250);
+  --border-strong: oklch(0.36 0.008 250);
   --ring: oklch(0.78 0.19 150);
 
   --state-bull: oklch(0.78 0.19 150);
   --state-bear: oklch(0.66 0.21 25);
-  --state-neutral: oklch(0.7 0.008 285);
+  --state-neutral: oklch(0.7 0.008 250);
   --state-warning: oklch(0.82 0.15 85);
   --state-veto: oklch(0.62 0.24 15);
   --state-info: oklch(0.78 0.12 210);
@@ -87,12 +87,12 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: oklch(0.32 0.006 285);
+  background: oklch(0.32 0.006 250);
   border-radius: 999px;
   border: 2px solid var(--background);
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: oklch(0.42 0.008 285);
+  background: oklch(0.42 0.008 250);
 }
 
 /* ---- motion (subtle, informative only) ---------------------------------- */
@@ -154,6 +154,6 @@ body {
 }
 
 .panel-grid {
-  background-image: radial-gradient(circle at 1px 1px, oklch(0.3 0.006 285) 1px, transparent 0);
+  background-image: radial-gradient(circle at 1px 1px, oklch(0.3 0.006 250) 1px, transparent 0);
   background-size: 22px 22px;
 }
