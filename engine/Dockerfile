@@ -1,10 +1,10 @@
-FROM node:20-bookworm-slim AS deps
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app/engine
 RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 WORKDIR /app/engine
 ENV NODE_ENV=production PORT=8790 MYCROFT_DB_PATH=/app/engine/data/mycroft.sqlite
 COPY --from=deps /app/engine/node_modules ./node_modules

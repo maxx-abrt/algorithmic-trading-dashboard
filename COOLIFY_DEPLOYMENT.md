@@ -9,7 +9,7 @@ There is no trade service and no OKX private credential requirement.
 
 ## Coolify setup
 
-1. Create a Docker Compose application from this repository and the `main` branch.
+1. Create a Docker Compose application from this repository and the `main` branch. The provided `Dockerfile`s now use Node 22, so no extra build configuration is needed.
 2. Route the public domain to `frontend` port `3000`. Do not expose engine port `8790` publicly.
 3. Keep the named volumes `mycroft-data` and `mycroft-backups` persistent.
 4. Set optional secrets in Coolify, never in Git:
@@ -17,7 +17,8 @@ There is no trade service and no OKX private credential requirement.
    - `GEMINI_MODEL` (default `gemini-2.5-flash`)
    - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` only if notifications are wanted
 5. Leave all `OKX_API_*` variables unset. Public market data needs no credentials and the codebase has no order endpoint.
-6. Deploy, then verify:
+6. If you deploy the services as individual Nixpacks applications instead of Docker Compose, the `package.json` `engines.node` and `.nvmrc` files are set to `22`, so Nixpacks will use Node 22 and the build will no longer fall back to EOL Node 18.
+7. Deploy, then verify:
    - `/api/health` returns `ok: true`
    - `ws.public.healthy` and `ws.business.healthy` are true after warm-up
    - `research.validationState` may honestly remain `NO_VALIDATED_MODEL`

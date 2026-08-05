@@ -1,9 +1,9 @@
-FROM node:20-bookworm-slim AS deps
+FROM node:22-bookworm-slim AS deps
 WORKDIR /app/frontend
 COPY package.json yarn.lock ./
 RUN yarn install --frozen-lockfile
 
-FROM node:20-bookworm-slim AS build
+FROM node:22-bookworm-slim AS build
 WORKDIR /app/frontend
 ENV NEXT_TELEMETRY_DISABLED=1
 ARG ENGINE_ORIGIN=http://engine:8790
@@ -12,7 +12,7 @@ COPY --from=deps /app/frontend/node_modules ./node_modules
 COPY . .
 RUN yarn build
 
-FROM node:20-bookworm-slim AS runtime
+FROM node:22-bookworm-slim AS runtime
 WORKDIR /app/frontend
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 ENGINE_ORIGIN=http://engine:8790
 COPY --from=build /app/frontend/package.json ./package.json

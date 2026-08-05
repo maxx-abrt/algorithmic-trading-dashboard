@@ -37,7 +37,7 @@ Convex remains supported as an optional mirror for existing installations, but i
 
 ## Local start
 
-Requirements: Node 20+, Yarn 1.x.
+Requirements: Node 22 (LTS), Yarn 1.x.
 
 ```bash
 cd engine
