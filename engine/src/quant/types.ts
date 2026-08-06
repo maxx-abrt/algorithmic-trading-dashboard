@@ -404,7 +404,7 @@ export interface RiskPlan {
   timeStopBars: number
   /** scenario estimate; inspect probabilityBasis before interpreting */
   winProbability: number
-  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior'
+  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior' | 'champion_calibrated_blend'
   validationState: 'INSUFFICIENT_EVIDENCE' | 'RESEARCH_CANDIDATE'
   expectancyR: number
   kellyFraction: number
@@ -465,6 +465,15 @@ export interface Analysis {
   narrative: string[]
   /** ultra-dense payload for the LLM (<300 tokens) */
   compact: Record<string, unknown>
+  /** free API market context: fear/greed, BTC dominance, trending */
+  marketContext: {
+    fearGreedIndex: number | null
+    fearGreedClassification: string | null
+    btcDominance: number | null
+    marketCapChange24h: number | null
+    trendingCoins: string[]
+    sentimentScore: number | null
+  } | null
   dataQuality: {
     ltfBars: number
     htfBars: number

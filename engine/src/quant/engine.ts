@@ -42,11 +42,14 @@ import { computeStructure, computeVolumeProfile, findDivergences, findSwings } f
 import { averageVolume, detectPatterns, patternScore } from './patterns'
 import { buildFactors, buildVetoes, composite, decide, edgeFactor, mtfAlignment, selectPlaybook } from './scoring'
 import { buildRiskPlan, stopAtrMultiplier, timeStop } from './risk'
+import { evaluateStrategies } from '../strategies/registry'
 import { barMinutes, barMs, barsPerYear, higherTimeframes, normalizeBar } from './timeframes'
 import { computeStats } from './stats'
 import { computeAdvancedVol, computeExtraTrend } from './extras'
 import { computeEdge, type EdgeBlock } from './edge'
 import { sessionInfo, type SessionInfo } from './sessions'
+import type { CalibratedLinearModel } from '../research/calibration'
+import type { MarketContext } from './market-context'
 
 /* -------------------------------------------------------------------------- */
 /*  Per-timeframe indicator computation                                        */
@@ -225,8 +228,9 @@ function buildNarrative(a: {
   vetoes: Analysis['vetoes']
   edge: EdgeBlock | null
   session: SessionInfo
+  marketContext: Analysis['marketContext']
 }): string[] {
-  const { indicators: i, mtf, plan, derivatives: dv, edge, session } = a
+  const { indicators: i, mtf, plan, derivatives: dv, edge, session, marketContext: mc } = a
   const out: string[] = []
 
   out.push(
@@ -338,6 +342,15 @@ function buildNarrative(a: {
 
   if (session.isEquity) {
     out.push(`Session: ${session.session} — ${session.note}.`)
+  }
+
+  if (mc) {
+    const bits: string[] = []
+    if (mc.fearGreedIndex != null) bits.push(`Fear/Greed ${mc.fearGreedIndex} (${mc.fearGreedClassification})`)
+    if (mc.btcDominance != null) bits.push(`BTC dominance ${mc.btcDominance.toFixed(1)}%`)
+    if (mc.marketCapChange24h != null) bits.push(`market cap ${mc.marketCapChange24h > 0 ? '+' : ''}${mc.marketCapChange24h.toFixed(1)}%/24h`)
+    if (mc.trendingCoins.length) bits.push(`trending: ${mc.trendingCoins.join(', ')}`)
+    if (bits.length) out.push(`Market context: ${bits.join(', ')}.`)
   }
 
   const top = [...a.factors].sort((x, y) => Math.abs(y.score * y.weight) - Math.abs(x.score * x.weight)).slice(0, 3)
@@ -487,6 +500,10 @@ export interface AnalyzeInput {
   /** free collateral from a read-only OKX balance */
   availableUsd?: number | null
   now?: number
+  /** calibrated champion model for win-probability blending */
+  championModel?: CalibratedLinearModel | null
+  /** free API market context: fear/greed, BTC dominance, trending */
+  marketContext?: MarketContext | null
 }
 
 export function analyze(input: AnalyzeInput): Analysis {
@@ -684,6 +701,22 @@ export function analyze(input: AnalyzeInput): Analysis {
 
   const playbook = decision === 'WAIT' ? selectPlaybook(indicators, finalSide, settings) : selectPlaybook(indicators, decision, settings)
 
+  // Compute playbook score for the champion model feature vector.
+  // evaluateStrategies needs an Analysis-like object; we construct a minimal one
+  // from the local variables available at this point in the pipeline.
+  const partialAnalysis = {
+    instId: input.instId,
+    timeframe: tf,
+    generatedAt: now,
+    price,
+    compositeScore: comp,
+    mtfAlignment: alignment,
+    indicators: { ...indicators, price },
+  } as Analysis
+  const strategyCandidates = evaluateStrategies(partialAnalysis)
+  const selectedCandidate = strategyCandidates.find((c) => c.eligible && c.side === (decision === 'WAIT' ? finalSide : decision))
+  const playbookScore = selectedCandidate?.score ?? 0
+
   const candidatePlan = buildRiskPlan({
     side: decision === 'WAIT' ? finalSide : decision,
     entry: price,
@@ -698,6 +731,10 @@ export function analyze(input: AnalyzeInput): Analysis {
     session,
     availableUsd: input.availableUsd ?? null,
     barMinutes: barMinutes(tf),
+    championModel: input.championModel ?? null,
+    compositeScore: comp,
+    mtfAlignment: alignment,
+    playbookScore,
   })
   if (decision !== 'WAIT' && candidatePlan.netExpectancyR <= 0) {
     vetoes.push({ id: 'non_positive_net_expectancy', reason: `Plan expectancy is ${candidatePlan.netExpectancyR.toFixed(2)}R after estimated costs`, severity: 'hard' })
@@ -739,6 +776,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     },
     narrative: [],
     compact: {},
+    marketContext: input.marketContext ?? null,
     dataQuality: {
       ltfBars: ltf.length,
       htfBars: htf.length,
@@ -763,6 +801,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     vetoes,
     edge,
     session,
+    marketContext: analysis.marketContext,
   })
   analysis.compact = {
     ...buildCompact(analysis),
@@ -778,6 +817,15 @@ export function analyze(input: AnalyzeInput): Analysis {
         }
       : null,
     patScore: Math.round(patternScore(indicators.patterns).score),
+    mctx: analysis.marketContext
+      ? {
+          fg: analysis.marketContext.fearGreedIndex,
+          fgc: analysis.marketContext.fearGreedClassification,
+          btcd: analysis.marketContext.btcDominance != null ? roundTo(analysis.marketContext.btcDominance, 1) : null,
+          mcap: analysis.marketContext.marketCapChange24h != null ? roundTo(analysis.marketContext.marketCapChange24h, 1) : null,
+          trend: analysis.marketContext.trendingCoins.slice(0, 3),
+        }
+      : null,
   }
 
   return analysis

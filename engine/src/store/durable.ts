@@ -4,7 +4,42 @@ import { dirname, resolve } from 'node:path'
 import type { Analysis, Candle } from '../quant/types.js'
 import type { PaperTrade } from '../paper/types.js'
 
-export const STORE_SCHEMA_VERSION = 1
+export const STORE_SCHEMA_VERSION = 2
+
+export interface ModelRegistryRow {
+  id: string
+  created_at: number
+  state: string
+  strategy: string
+  version: string
+  metrics_json: Record<string, unknown>
+  artifact_path: string | null
+  rollback_reason: string | null
+  settings_json: string | null
+  weights_json: string | null
+  promoted_at: number | null
+  retired_at: number | null
+  parent_id: string | null
+  canary_status: string | null
+  live_mean_r: number | null
+  live_win_rate: number | null
+  live_trades_count: number | null
+  live_max_drawdown_r: number | null
+}
+
+export interface TrainingRow {
+  id: number
+  model_id: string
+  observed_at: number
+  inst_id: string
+  timeframe: string
+  features_json: string
+  label: number
+  net_r: number | null
+  trade_id: string | null
+  source: string
+  features: number[]
+}
 
 export interface CandidateRecord {
   id: string
@@ -107,7 +142,42 @@ export class DurableStore {
         id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, key TEXT NOT NULL, payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL, delivered_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS champion_training_rows (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        model_id TEXT NOT NULL,
+        observed_at INTEGER NOT NULL,
+        inst_id TEXT NOT NULL,
+        timeframe TEXT NOT NULL,
+        features_json TEXT NOT NULL,
+        label INTEGER NOT NULL,
+        net_r REAL,
+        trade_id TEXT,
+        source TEXT NOT NULL DEFAULT 'live',
+        FOREIGN KEY (model_id) REFERENCES model_registry(id)
+      );
+      CREATE INDEX IF NOT EXISTS champion_training_rows_model ON champion_training_rows(model_id, observed_at DESC);
+      CREATE TABLE IF NOT EXISTS champion_canary_trades (
+        trade_id TEXT PRIMARY KEY,
+        model_id TEXT NOT NULL,
+        opened_at INTEGER NOT NULL,
+        closed_at INTEGER,
+        net_r REAL
+      );
     `)
+    // Add columns to model_registry for champion lifecycle (v2 migration).
+    const addColumn = (col: string, def: string) => {
+      try { this.db.exec(`ALTER TABLE model_registry ADD COLUMN ${col} ${def}`) } catch { /* column already exists */ }
+    }
+    addColumn('settings_json', 'TEXT')
+    addColumn('weights_json', 'TEXT')
+    addColumn('promoted_at', 'INTEGER')
+    addColumn('retired_at', 'INTEGER')
+    addColumn('parent_id', 'TEXT')
+    addColumn('canary_status', 'TEXT')
+    addColumn('live_mean_r', 'REAL')
+    addColumn('live_win_rate', 'REAL')
+    addColumn('live_trades_count', 'INTEGER')
+    addColumn('live_max_drawdown_r', 'REAL')
     this.db.prepare('DELETE FROM paper_events WHERE trade_id LIKE ?').run('campaign:%')
     this.db.prepare('DELETE FROM paper_trades WHERE id LIKE ?').run('campaign:%')
     this.db.prepare('INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
@@ -282,10 +352,130 @@ export class DurableStore {
     )
   }
 
-  registerModel(model: { id: string; state: string; strategy: string; version: string; metrics: unknown; artifactPath?: string; rollbackReason?: string }) {
-    this.db.prepare(`INSERT OR REPLACE INTO model_registry(id,created_at,state,strategy,version,metrics_json,artifact_path,rollback_reason) VALUES (?,?,?,?,?,?,?,?)`).run(
+  registerModel(model: { id: string; state: string; strategy: string; version: string; metrics: unknown; artifactPath?: string; rollbackReason?: string; settingsJson?: string; weightsJson?: string; parentId?: string }) {
+    this.db.prepare(`INSERT OR REPLACE INTO model_registry(id,created_at,state,strategy,version,metrics_json,artifact_path,rollback_reason,settings_json,weights_json,parent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
       model.id, Date.now(), model.state, model.strategy, model.version, JSON.stringify(model.metrics), model.artifactPath ?? null, model.rollbackReason ?? null,
+      model.settingsJson ?? null, model.weightsJson ?? null, model.parentId ?? null,
     )
+  }
+
+  promoteModel(id: string, settingsJson?: string, weightsJson?: string) {
+    this.db.prepare(`UPDATE model_registry SET state='paper_champion', promoted_at=?, settings_json=?, weights_json=? WHERE id=?`).run(
+      Date.now(), settingsJson ?? null, weightsJson ?? null, id,
+    )
+  }
+
+  retireModel(id: string, reason: string, state = 'rolled_back') {
+    this.db.prepare(`UPDATE model_registry SET state=?, retired_at=?, rollback_reason=? WHERE id=?`).run(
+      state, Date.now(), reason, id,
+    )
+  }
+
+  setCanaryStatus(id: string, status: string) {
+    this.db.prepare(`UPDATE model_registry SET canary_status=? WHERE id=?`).run(status, id)
+  }
+
+  updateLiveStats(id: string, meanR: number, winRate: number, tradesCount: number, maxDrawdownR: number) {
+    this.db.prepare(`UPDATE model_registry SET live_mean_r=?, live_win_rate=?, live_trades_count=?, live_max_drawdown_r=? WHERE id=?`).run(
+      meanR, winRate, tradesCount, maxDrawdownR, id,
+    )
+  }
+
+  getModel(id: string): ModelRegistryRow | null {
+    const row = this.db.prepare('SELECT * FROM model_registry WHERE id=?').get(id) as Record<string, unknown> | undefined
+    if (!row) return null
+    return {
+      id: String(row.id),
+      created_at: Number(row.created_at),
+      state: String(row.state),
+      strategy: String(row.strategy),
+      version: String(row.version),
+      metrics_json: JSON.parse(String(row.metrics_json ?? '{}')),
+      artifact_path: row.artifact_path ? String(row.artifact_path) : null,
+      rollback_reason: row.rollback_reason ? String(row.rollback_reason) : null,
+      settings_json: row.settings_json ? String(row.settings_json) : null,
+      weights_json: row.weights_json ? String(row.weights_json) : null,
+      promoted_at: row.promoted_at != null ? Number(row.promoted_at) : null,
+      retired_at: row.retired_at != null ? Number(row.retired_at) : null,
+      parent_id: row.parent_id ? String(row.parent_id) : null,
+      canary_status: row.canary_status ? String(row.canary_status) : null,
+      live_mean_r: row.live_mean_r != null ? Number(row.live_mean_r) : null,
+      live_win_rate: row.live_win_rate != null ? Number(row.live_win_rate) : null,
+      live_trades_count: row.live_trades_count != null ? Number(row.live_trades_count) : null,
+      live_max_drawdown_r: row.live_max_drawdown_r != null ? Number(row.live_max_drawdown_r) : null,
+    }
+  }
+
+  listModelsByState(state: string): ModelRegistryRow[] {
+    return (this.db.prepare('SELECT * FROM model_registry WHERE state=? ORDER BY created_at DESC').all(state) as Record<string, unknown>[])
+      .map((row) => ({
+        id: String(row.id),
+        created_at: Number(row.created_at),
+        state: String(row.state),
+        strategy: String(row.strategy),
+        version: String(row.version),
+        metrics_json: JSON.parse(String(row.metrics_json ?? '{}')),
+        artifact_path: row.artifact_path ? String(row.artifact_path) : null,
+        rollback_reason: row.rollback_reason ? String(row.rollback_reason) : null,
+        settings_json: row.settings_json ? String(row.settings_json) : null,
+        weights_json: row.weights_json ? String(row.weights_json) : null,
+        promoted_at: row.promoted_at != null ? Number(row.promoted_at) : null,
+        retired_at: row.retired_at != null ? Number(row.retired_at) : null,
+        parent_id: row.parent_id ? String(row.parent_id) : null,
+        canary_status: row.canary_status ? String(row.canary_status) : null,
+        live_mean_r: row.live_mean_r != null ? Number(row.live_mean_r) : null,
+        live_win_rate: row.live_win_rate != null ? Number(row.live_win_rate) : null,
+        live_trades_count: row.live_trades_count != null ? Number(row.live_trades_count) : null,
+        live_max_drawdown_r: row.live_max_drawdown_r != null ? Number(row.live_max_drawdown_r) : null,
+      }))
+  }
+
+  recordTrainingRow(row: { modelId: string; observedAt: number; instId: string; timeframe: string; features: number[]; label: number; netR?: number; tradeId?: string; source?: string }) {
+    this.db.prepare(`INSERT INTO champion_training_rows(model_id,observed_at,inst_id,timeframe,features_json,label,net_r,trade_id,source) VALUES (?,?,?,?,?,?,?,?,?)`).run(
+      row.modelId, row.observedAt, row.instId, row.timeframe, JSON.stringify(row.features), row.label, row.netR ?? null, row.tradeId ?? null, row.source ?? 'live',
+    )
+  }
+
+  listTrainingRows(modelId: string, beforeTs?: number, limit = 5000): TrainingRow[] {
+    const rows = beforeTs != null
+      ? this.db.prepare('SELECT * FROM champion_training_rows WHERE model_id=? AND observed_at<? ORDER BY observed_at DESC LIMIT ?').all(modelId, beforeTs, limit) as Record<string, unknown>[]
+      : this.db.prepare('SELECT * FROM champion_training_rows WHERE model_id=? ORDER BY observed_at DESC LIMIT ?').all(modelId, limit) as Record<string, unknown>[]
+    return rows.map((row) => ({
+      id: Number(row.id),
+      model_id: String(row.model_id),
+      observed_at: Number(row.observed_at),
+      inst_id: String(row.inst_id),
+      timeframe: String(row.timeframe),
+      features_json: String(row.features_json ?? '[]'),
+      label: Number(row.label),
+      net_r: row.net_r == null ? null : Number(row.net_r),
+      trade_id: row.trade_id ? String(row.trade_id) : null,
+      source: String(row.source ?? 'live'),
+      features: JSON.parse(String(row.features_json ?? '[]')) as number[],
+    }))
+  }
+
+  recordCanaryTrade(tradeId: string, modelId: string, openedAt: number) {
+    this.db.prepare(`INSERT OR REPLACE INTO champion_canary_trades(trade_id,model_id,opened_at) VALUES (?,?,?)`).run(
+      tradeId, modelId, openedAt,
+    )
+  }
+
+  closeCanaryTrade(tradeId: string, closedAt: number, netR: number) {
+    this.db.prepare(`UPDATE champion_canary_trades SET closed_at=?, net_r=? WHERE trade_id=?`).run(
+      closedAt, netR, tradeId,
+    )
+  }
+
+  listCanaryTrades(modelId: string) {
+    return (this.db.prepare('SELECT * FROM champion_canary_trades WHERE model_id=? ORDER BY opened_at').all(modelId) as Record<string, unknown>[])
+      .map((row) => ({
+        trade_id: String(row.trade_id),
+        model_id: String(row.model_id),
+        opened_at: Number(row.opened_at),
+        closed_at: row.closed_at == null ? null : Number(row.closed_at),
+        net_r: row.net_r == null ? null : Number(row.net_r),
+      }))
   }
 
   researchState() {
@@ -293,7 +483,7 @@ export class DurableStore {
     const campaigns = parse(this.db.prepare('SELECT * FROM research_campaigns ORDER BY created_at DESC LIMIT 100').all() as Record<string, unknown>[], 'manifest_json')
     const trials = parse(this.db.prepare('SELECT * FROM experiment_trials ORDER BY created_at DESC LIMIT 300').all() as Record<string, unknown>[], 'metrics_json')
     const models = parse(this.db.prepare('SELECT * FROM model_registry ORDER BY created_at DESC LIMIT 100').all() as Record<string, unknown>[], 'metrics_json')
-    return { campaigns, trials, models, champion: models.find((row) => row.state === 'paper_champion') ?? null, validationState: models.some((row) => row.state === 'paper_champion') ? 'VALIDATED' : 'NO_VALIDATED_MODEL' }
+    return { campaigns, trials, models, champion: models.find((row) => row.state === 'paper_champion') ?? null, canary: models.find((row) => row.state === 'paper_canary') ?? null, validationState: models.some((row) => row.state === 'paper_champion') ? 'VALIDATED' : 'NO_VALIDATED_MODEL' }
   }
 
   pruneCandles(beforeTs: number) {

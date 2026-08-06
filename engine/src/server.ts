@@ -296,7 +296,45 @@ const routes: Record<string, Handler> = {
       timeframe: ['5m', '15m', '1H'].includes(String(body.timeframe)) ? String(body.timeframe) as '5m' | '15m' | '1H' : undefined,
       maxEvaluations: body.maxEvaluations == null ? undefined : Number(body.maxEvaluations),
       hypothesis: body.hypothesis ? String(body.hypothesis) : undefined,
+      autoPromote: body.autoPromote == null ? undefined : Boolean(body.autoPromote),
     })
+  },
+
+  'GET /api/research/champion': () => {
+    const state = runtime.store.researchState()
+    const champion = runtime.champion.current
+    const health = runtime.champion.health()
+    const canaryTrades = state.canary ? runtime.store.listCanaryTrades(String((state.canary as Record<string, unknown>).id)) : []
+    const trainingRowCount = champion.modelId ? runtime.store.listTrainingRows(champion.modelId).length : 0
+    return {
+      champion: champion.modelId ? state.champion : null,
+      championModel: champion,
+      canary: state.canary ?? null,
+      health,
+      canaryTrades: canaryTrades.length,
+      trainingRows: trainingRowCount,
+    }
+  },
+
+  'POST /api/research/promote': async (req) => {
+    const body = await readBody(req)
+    const modelId = String(body.modelId ?? '')
+    if (!modelId) throw new Error('modelId required')
+    const result = runtime.champion.promote(modelId)
+    if (!result.ok) throw new Error(result.reason)
+    return { ok: true, modelId, reason: result.reason }
+  },
+
+  'POST /api/research/rollback': async (req) => {
+    const body = await readBody(req)
+    const reason = body.reason ? String(body.reason) : 'manual_rollback'
+    const result = runtime.champion.rollback(reason)
+    return result
+  },
+
+  'POST /api/research/retrain': async () => {
+    const result = runtime.champion.retrainChampion()
+    return result
   },
 
   'GET /api/operations': () => ({

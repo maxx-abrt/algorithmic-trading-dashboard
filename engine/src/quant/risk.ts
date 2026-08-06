@@ -9,6 +9,8 @@
 import { clamp, floorToLot, roundToTick } from './math'
 import type { EdgeBlock } from './edge'
 import type { SessionInfo } from './sessions'
+import type { CalibratedLinearModel } from '../research/calibration'
+import { predictCalibrated } from '../research/calibration'
 import type {
   DerivativesBlock,
   EngineSettings,
@@ -83,6 +85,14 @@ export interface BuildPlanInput {
   /** free collateral from the real OKX balance, when read-only keys exist */
   availableUsd?: number | null
   barMinutes?: number
+  /** calibrated champion model for win-probability blending */
+  championModel?: CalibratedLinearModel | null
+  /** playbook score from evaluateStrategies, used as a champion feature */
+  playbookScore?: number
+  /** composite score from the analysis, used as a champion feature */
+  compositeScore?: number
+  /** mtf alignment from the analysis, used as a champion feature */
+  mtfAlignment?: number
 }
 
 function fmtUsd(n: number) {
@@ -310,8 +320,29 @@ export function buildRiskPlan(input: BuildPlanInput): RiskPlan {
   /* ---- 8. Expectancy, calibrated by real history ---------------------- */
   const convictionProb = clamp(0.34 + (conviction / 100) * 0.36, 0.3, 0.72)
   const empirical = edge && edge.sample >= 8 ? edge.adjustedWinRate / 100 : null
+  let modelProb: number | null = null
+  if (input.championModel) {
+    const features = [
+      (input.compositeScore ?? 0) / 100,
+      (input.mtfAlignment ?? 0) / 100,
+      i.trend.adx / 50,
+      i.momentum.rsi / 100,
+      i.volatility.atrPct / 10,
+      i.volume.volumeRatio / 3,
+      (input.playbookScore ?? 0) / 100,
+    ]
+    try { modelProb = predictCalibrated(input.championModel, features) } catch { modelProb = null }
+  }
   const blend = empirical != null ? clamp(edge!.confidence, 0, 0.7) : 0
-  const winProbability = clamp(convictionProb * (1 - blend) + (empirical ?? 0) * blend, 0.25, 0.75)
+  const modelBlend = modelProb != null && input.championModel ? clamp(input.championModel.featureCount / 7, 0, 0.25) : 0
+  const totalBlend = clamp(blend + modelBlend, 0, 0.85)
+  const winProbability = clamp(
+    convictionProb * (1 - totalBlend) +
+      (empirical ?? 0) * blend +
+      (modelProb ?? 0) * modelBlend,
+    0.25,
+    0.75,
+  )
   const expectancyR = winProbability * expectedRr - (1 - winProbability)
   const netExpectancyR = winProbability * (expectedRr - costR) - (1 - winProbability) * (1 + costR)
   const kellyFraction = clamp(
@@ -365,7 +396,7 @@ export function buildRiskPlan(input: BuildPlanInput): RiskPlan {
     ),
     timeStopBars: bars,
     winProbability,
-    probabilityBasis: empirical != null ? 'empirical_shrunk_with_heuristic_prior' : 'heuristic_scenario_not_calibrated',
+    probabilityBasis: modelProb != null ? 'champion_calibrated_blend' : empirical != null ? 'empirical_shrunk_with_heuristic_prior' : 'heuristic_scenario_not_calibrated',
     validationState: edge && edge.sample >= 30 ? 'RESEARCH_CANDIDATE' : 'INSUFFICIENT_EVIDENCE',
     expectancyR,
     kellyFraction,

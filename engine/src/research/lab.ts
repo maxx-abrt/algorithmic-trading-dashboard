@@ -12,12 +12,15 @@ import { evaluateStrategies } from '../strategies/registry.js'
 import type { DurableStore } from '../store/durable.js'
 import { manifestHash, purgedWalkForward, validationMetrics } from './validation.js'
 import { trainCalibratedLinear, type LabelledFeatureRow } from './calibration.js'
+import type { ChampionService } from './champion.js'
+import { getCachedMarketContext } from '../quant/market-context.js'
 
 export interface CampaignRequest {
   symbols?: string[]
   timeframe?: '5m' | '15m' | '1H'
   maxEvaluations?: number
   hypothesis?: string
+  autoPromote?: boolean
 }
 
 export interface CampaignResult {
@@ -40,7 +43,7 @@ const closedAt = (candle: Candle, timeframe: string) => {
 export class ResearchLab {
   private running = false
 
-  constructor(private readonly store: DurableStore) {}
+  constructor(private readonly store: DurableStore, private readonly champion?: ChampionService) {}
 
   governor() {
     const rssMb = process.memoryUsage().rss / 1024 / 1024
@@ -115,6 +118,7 @@ export class ResearchLab {
             htf: htf.filter((row) => row.ts < availableAt).slice(-220),
             htf2: htf2.filter((row) => row.ts < availableAt).slice(-160),
             livePrice: signalBar.close, volUsd24h: ticker.volUsd24h, now: availableAt,
+            marketContext: getCachedMarketContext(),
             settings: {
               ...DEFAULT_SETTINGS,
               timeframe,
@@ -199,6 +203,19 @@ export class ResearchLab {
         artifactPath,
         rollbackReason: promotionReasons.join(',') || undefined,
       })
+      // Champion promotion hook: evaluate the candidate and start canary if appropriate
+      if (validationState === 'SHADOW_CANDIDATE' && (request.autoPromote ?? true) && this.champion) {
+        const modelId = `model:${result.manifestHash.slice(0, 16)}`
+        const evaluation = this.champion.evaluateCandidate(result)
+        if (evaluation.shouldCanary) {
+          this.store.setCanaryStatus(modelId, 'canary_running')
+          this.champion.startCanary(modelId)
+          result.promotionReasons = [...result.promotionReasons, `auto_canary_started:${evaluation.reasons.join(',')}`]
+        } else {
+          this.store.retireModel(modelId, evaluation.reasons.join(','), 'retired')
+          result.promotionReasons = [...result.promotionReasons, `auto_promote_skipped:${evaluation.reasons.join(',')}`]
+        }
+      }
       this.store.upsertCampaign({ id: campaignId, status: 'completed', hypothesis, budget: { maxEvaluations, symbols: symbols.length }, manifest: { ...manifest, result } })
       return result
     } catch (error) {

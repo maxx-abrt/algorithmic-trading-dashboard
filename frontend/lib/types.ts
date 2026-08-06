@@ -51,7 +51,7 @@ export interface RiskPlan {
   invalidation: number
   timeStopBars: number
   winProbability: number
-  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior'
+  probabilityBasis: 'heuristic_scenario_not_calibrated' | 'empirical_shrunk_with_heuristic_prior' | 'champion_calibrated_blend'
   validationState: 'INSUFFICIENT_EVIDENCE' | 'RESEARCH_CANDIDATE'
   expectancyR: number
   kellyFraction: number
@@ -192,6 +192,14 @@ export interface Analysis {
   liquidity: { volUsd24h: number | null; spreadBps: number | null }
   narrative: string[]
   compact: Record<string, unknown>
+  marketContext: {
+    fearGreedIndex: number | null
+    fearGreedClassification: string | null
+    btcDominance: number | null
+    marketCapChange24h: number | null
+    trendingCoins: string[]
+    sentimentScore: number | null
+  } | null
   dataQuality: { ltfBars: number; htfBars: number; htf2Bars: number; staleMs: number; warnings: string[] }
 }
 
@@ -520,14 +528,40 @@ export interface StrategyCandidateRow {
   }
 }
 
+export interface ChampionState {
+  modelId: string | null
+  version: string | null
+  artifact: unknown
+  artifactPath: string | null
+}
+
+export interface ChampionHealth {
+  meanR: number
+  winRate: number
+  trades: number
+  maxDrawdownR: number
+  shouldRollback: boolean
+  reason: string | null
+}
+
+export interface ChampionResponse {
+  champion: Record<string, unknown> | null
+  championModel: ChampionState
+  canary: Record<string, unknown> | null
+  health: ChampionHealth
+  canaryTrades: number
+  trainingRows: number
+}
+
 export interface ResearchState {
   validationState: string
   champion: Record<string, unknown> | null
+  canary: Record<string, unknown> | null
   governor: { allowed: boolean; reasons: string[]; rssMb: number; load1: number; maxRssMb: number; maxLoad: number; running: boolean }
   schedule: { enabled: boolean; intervalHours: number }
   campaigns: Record<string, unknown>[]
   trials: { id: string; campaign_id: string; created_at: number; status: string; config_hash: string; metrics_json: Record<string, number | null | number[]> }[]
-  models: { id: string; created_at: number; state: string; strategy: string; version: string; metrics_json: Record<string, unknown>; rollback_reason?: string }[]
+  models: { id: string; created_at: number; state: string; strategy: string; version: string; metrics_json: Record<string, unknown>; rollback_reason?: string; canary_status?: string; live_mean_r?: number; live_win_rate?: number; live_trades_count?: number; live_max_drawdown_r?: number }[]
 }
 
 export interface OperationsState {

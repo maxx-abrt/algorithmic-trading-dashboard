@@ -41,6 +41,8 @@ import { createPaperPlan, processPaperBar, submitPaperPlan } from './paper/broke
 import { assessPaperRisk, DEFAULT_RISK_POLICY } from './paper/risk.js'
 import type { PaperTrade } from './paper/types.js'
 import { ResearchLab } from './research/lab.js'
+import { ChampionService } from './research/champion.js'
+import { fetchMarketContext, getCachedMarketContext, type MarketContext } from './quant/market-context.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
 /* -------------------------------------------------------------------------- */
@@ -225,7 +227,8 @@ export class Runtime {
   mutedChats = new Set<number>()
   startedAt = Date.now()
   store = new DurableStore()
-  research = new ResearchLab(this.store)
+  champion!: ChampionService
+  research!: ResearchLab
   paperTrades = new Map<string, PaperTrade>()
   paperKillSwitch = this.store.getState<boolean>('paper_kill_switch', false)
   latestCandidates = new Map<string, StrategyCandidate[]>()
@@ -239,9 +242,12 @@ export class Runtime {
   gemini: GeminiOrchestrator
   bot: TelegramBot
   universeLoadedAt = 0
+  marketContext: MarketContext | null = null
 
   constructor() {
     candleStore.attachDurableStore(this.store)
+    this.champion = new ChampionService(this.store)
+    this.research = new ResearchLab(this.store, this.champion)
     for (const trade of this.store.loadActiveTrades()) this.paperTrades.set(trade.id, trade)
     this.gemini = new GeminiOrchestrator(ENV.gemini.apiKey)
     this.bot = new TelegramBot(ENV.telegram.token)
@@ -273,6 +279,8 @@ export class Runtime {
     await this.refreshUniverse()
     await this.refreshTickers()
     await this.seedDefaults()
+    this.champion.loadFromStore()
+    this.champion.loadCanaryFromStore()
     this.stream.connect()
     this.syncSubscriptions()
 
@@ -300,6 +308,8 @@ export class Runtime {
     every(10_000, () => this.paperLoop(), 'paper-broker')
     every(10 * 60_000, () => this.maintenanceLoop(), 'maintenance')
     every(30 * 60_000, () => this.autoResearchLoop(), 'auto-research')
+    every(10 * 60_000, () => this.championLoop(), 'champion-lifecycle')
+    every(15 * 60_000, () => this.refreshMarketContext(), 'market-context')
     every(30_000, () => this.telemetryLoop(), 'telemetry')
     every(5_000, () => log.flush(), 'logflush')
     every(60_000, () => this.refreshAccount(), 'account')
@@ -438,6 +448,14 @@ export class Runtime {
     }
   }
 
+  async refreshMarketContext() {
+    try {
+      this.marketContext = await fetchMarketContext()
+    } catch (err) {
+      log.error('market-context', err instanceof Error ? err.message : String(err))
+    }
+  }
+
   async refreshAccount() {
     if (!HAS_OKX_KEYS || !this.settings.useAccountBalance) return
     try {
@@ -562,6 +580,8 @@ export class Runtime {
       livePrice: ticker?.last ?? null,
       volUsd24h: ticker?.volUsd24h ?? null,
       availableUsd: this.account?.availableUsdt ?? null,
+      championModel: this.champion.model,
+      marketContext: this.marketContext,
     })
     this.counters.evaluations++
 
@@ -685,7 +705,8 @@ export class Runtime {
     const featureTime = a.generatedAt - Math.max(0, a.dataQuality.staleMs)
     const policyVersion = 'explicit-playbooks-v1'
     const decisionId = `${a.instId}:${a.timeframe}:${featureTime}`
-    this.store.recordDecision(decisionId, a, policyVersion, this.store.researchState().champion ? 'paper-champion' : 'NO_VALIDATED_MODEL')
+    const modelVersion = this.champion.modelVersion
+    this.store.recordDecision(decisionId, a, policyVersion, modelVersion)
 
     const candidates = evaluateStrategies(a)
     this.latestCandidates.set(this.key(a.instId, a.timeframe), candidates)
@@ -723,7 +744,7 @@ export class Runtime {
       signalAt: a.generatedAt,
       playbook: selected.playbook,
       policyVersion,
-      modelVersion: this.store.researchState().champion ? 'paper-champion' : 'heuristic-baseline',
+      modelVersion,
       plan: a.plan,
       atrAtEntry: a.indicators.volatility.atr,
       feeBps: this.settings.takerFeeBps,
@@ -753,6 +774,10 @@ export class Runtime {
     } else {
       this.paperTrades.set(trade.id, trade)
       this.counters.signals++
+      // Record as canary trade if a canary is active
+      if (this.champion.canaryId) {
+        this.store.recordCanaryTrade(trade.id, this.champion.canaryId, a.generatedAt)
+      }
       log.signal('paper', `armed ${a.decision} ${a.instId} ${a.timeframe} for paper validation only`, { instId: a.instId, timeframe: a.timeframe })
     }
     this.store.saveTrade(trade)
@@ -885,6 +910,44 @@ export class Runtime {
       this.store.saveTrade(trade)
       if (trade.status === 'closed' || trade.status === 'expired') {
         log.signal('paper', `${trade.plan.instId} ${trade.plan.side} ${trade.exitReason} ${trade.netRealizedR >= 0 ? '+' : ''}${trade.netRealizedR.toFixed(2)}R net`, { instId: trade.plan.instId, timeframe: trade.plan.timeframe })
+        // Record training row — always accumulate data, even without a champion
+        const analysis = this.analyses.get(this.key(trade.plan.instId, trade.plan.timeframe))
+        if (analysis) {
+          const candidates = evaluateStrategies(analysis)
+          const selected = candidates.find((c) => c.eligible && c.side === trade.plan.side)
+          const features = [
+            analysis.compositeScore / 100,
+            analysis.mtfAlignment / 100,
+            analysis.indicators.trend.adx / 50,
+            analysis.indicators.momentum.rsi / 100,
+            analysis.indicators.volatility.atrPct / 10,
+            analysis.indicators.volume.volumeRatio / 3,
+            (selected?.score ?? 0) / 100,
+          ]
+          const trainingModelId = this.champion.current.modelId ?? 'baseline'
+          this.champion.recordTrainingRow({
+            modelId: trainingModelId,
+            observedAt: trade.plan.signalAt,
+            instId: trade.plan.instId,
+            timeframe: trade.plan.timeframe,
+            features,
+            label: trade.netRealizedR > 0 ? 1 : 0,
+            netR: trade.netRealizedR,
+            tradeId: trade.id,
+          })
+        }
+        // Close canary trade if this was a canary
+        if (this.champion.canaryId) {
+          this.store.closeCanaryTrade(trade.id, trade.closedAt ?? Date.now(), trade.netRealizedR)
+        }
+      }
+    }
+    // Check champion health for potential rollback
+    if (this.champion.hasChampion) {
+      const health = this.champion.health()
+      if (health.shouldRollback && health.reason) {
+        log.error('champion', `rollback triggered: ${health.reason}`)
+        this.champion.rollback(health.reason)
       }
     }
   }
@@ -894,6 +957,105 @@ export class Runtime {
     candleStore.evict(keep)
     this.store.pruneCandles(Date.now() - 365 * 24 * 60 * 60_000)
     this.store.checkpoint()
+  }
+
+  private async championLoop() {
+    if (!this.settings.engineEnabled) return
+
+    // 1. Check canary promotion: if a canary is running, evaluate it
+    if (this.champion.canaryId) {
+      const evaluation = this.champion.compareCanary(this.champion.canaryId)
+      if (evaluation.shouldPromote) {
+        log.info('champion', `auto-promoting canary ${this.champion.canaryId}: ${evaluation.reasons.join(', ')}`)
+        this.champion.promoteCanary(this.champion.canaryId)
+      } else if (evaluation.reasons.some((r) => r.includes('canary_expired_by_age'))) {
+        log.info('champion', `canary expired by age, retiring: ${evaluation.reasons.join(', ')}`)
+        this.store.retireModel(this.champion.canaryId, 'canary_expired', 'retired')
+        this.champion.loadCanaryFromStore()
+      }
+    }
+
+    // 2. Auto-retrain: every 50 closed trades or 6 hours, whichever comes first
+    if (this.champion.hasChampion) {
+      const lastRetrain = this.store.getState<number>('last_champion_retrain', 0)
+      const retrainIntervalMs = Number(process.env.CHAMPION_RETRAIN_INTERVAL_MS ?? 6 * 60 * 60_000)
+      const retrainMinTrades = Number(process.env.CHAMPION_RETRAIN_MIN_TRADES ?? 50)
+      const trainingRows = this.champion.current.modelId ? this.store.listTrainingRows(this.champion.current.modelId).length : 0
+      const baselineRows = this.store.listTrainingRows('baseline').length
+      const totalRows = trainingRows + baselineRows
+      const dueByTime = Date.now() - lastRetrain > retrainIntervalMs
+      const dueByTrades = totalRows >= retrainMinTrades
+      if (dueByTime || dueByTrades) {
+        log.info('champion', `auto-retrain triggered (time=${dueByTime}, trades=${totalRows}>=${retrainMinTrades})`)
+        // If we have baseline data, merge it into the champion's training set first
+        if (baselineRows > 0 && this.champion.current.modelId) {
+          const baseline = this.store.listTrainingRows('baseline')
+          for (const row of baseline) {
+            this.store.recordTrainingRow({
+              modelId: this.champion.current.modelId,
+              observedAt: row.observed_at,
+              instId: row.inst_id,
+              timeframe: row.timeframe,
+              features: row.features,
+              label: row.label,
+              netR: row.net_r ?? undefined,
+              tradeId: row.trade_id ?? undefined,
+              source: 'baseline_merge',
+            })
+          }
+          // Clear baseline rows after merging
+          this.store.setState('baseline_merged_at', Date.now())
+        }
+        const result = this.champion.retrainChampion()
+        if (result.accepted) {
+          this.store.setState('last_champion_retrain', Date.now())
+          log.info('champion', `retrain accepted: ${result.reason}`)
+        } else {
+          log.info('champion', `retrain skipped: ${result.reason}`)
+          // Still update the timestamp so we don't retry every 10 min
+          this.store.setState('last_champion_retrain', Date.now())
+        }
+      }
+    } else if (!this.champion.canaryId) {
+      // 3. No champion and no canary: if we have enough baseline data, try to train a first champion
+      const baselineRows = this.store.listTrainingRows('baseline').length
+      if (baselineRows >= 30) {
+        log.info('champion', `attempting to train first champion from ${baselineRows} baseline rows`)
+        // Register a model from baseline training data
+        const baseline = this.store.listTrainingRows('baseline')
+        const { trainCalibratedLinear } = await import('./research/calibration.js')
+        const { manifestHash } = await import('./research/validation.js')
+        const { writeFileSync, mkdirSync } = await import('node:fs')
+        const { join, resolve } = await import('node:path')
+        const labelled = baseline.map((r) => ({ at: r.observed_at, symbol: r.inst_id, features: r.features, label: r.label as 0 | 1 }))
+        const model = trainCalibratedLinear(labelled)
+        if (model) {
+          const artifactHash = manifestHash(model)
+          const root = resolve(process.env.RESEARCH_ARTIFACTS_PATH ?? join(process.cwd(), 'data/research-artifacts'), artifactHash)
+          mkdirSync(root, { recursive: true })
+          const artifactPath = join(root, 'model.json')
+          writeFileSync(artifactPath, JSON.stringify({ model, featureOrder: ['composite', 'mtf', 'adx', 'rsi', 'atrPct', 'volumeRatio', 'playbookScore'] }, null, 2))
+          const modelId = `model:${artifactHash.slice(0, 16)}`
+          this.store.registerModel({
+            id: modelId, state: 'paper_champion', strategy: 'baseline-trained',
+            version: artifactHash.slice(0, 12),
+            metrics: { validationBrier: model.validationBrier, trainedRows: model.trainedRows, validationRows: model.validationRows, source: 'baseline' },
+            artifactPath,
+          })
+          // Merge baseline rows into the new champion
+          for (const row of baseline) {
+            this.store.recordTrainingRow({
+              modelId, observedAt: row.observed_at, instId: row.inst_id, timeframe: row.timeframe,
+              features: row.features, label: row.label, netR: row.net_r ?? undefined,
+              tradeId: row.trade_id ?? undefined, source: 'baseline_merge',
+            })
+          }
+          this.champion.loadFromStore()
+          this.store.setState('last_champion_retrain', Date.now())
+          log.info('champion', `first champion trained from baseline data: ${modelId}`)
+        }
+      }
+    }
   }
 
   private async autoResearchLoop() {
@@ -1118,13 +1280,14 @@ export class Runtime {
       convex: convex.health,
       localStore: this.store.summary(),
       paper: { ...this.store.paperStats(), active: this.store.loadActiveTrades().length, killSwitch: this.paperKillSwitch },
-      research: { validationState: research.validationState, governor: this.research.governor(), champion: research.champion },
+      research: { validationState: research.validationState, governor: this.research.governor(), champion: research.champion, canary: research.canary, championModel: this.champion.current },
       resources: { rssMb, freeMemoryMb: freemem() / 1024 / 1024, totalMemoryMb: totalmem() / 1024 / 1024, load1: loadavg()[0] },
       counters: this.counters,
       scanner: { at: this.scan.at, scanned: this.scan.scanned, running: this.scan.running },
       account: this.account,
       okxKeys: HAS_OKX_KEYS,
       analyses: this.analyses.size,
+      marketContext: this.marketContext,
     }
   }
 

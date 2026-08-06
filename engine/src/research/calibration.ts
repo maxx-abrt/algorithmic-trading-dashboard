@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+
 export interface LabelledFeatureRow {
   at: number
   symbol: string
@@ -85,4 +87,12 @@ export function predictCalibrated(model: CalibratedLinearModel, features: readon
   if (features.length !== model.featureCount) throw new Error('feature count mismatch')
   const normalized = features.map((value, index) => (value - model.means[index]) / model.scales[index])
   return sigmoid(model.plattA * (dot(model.weights, normalized) + model.bias) + model.plattB)
+}
+
+export function loadCalibratedModel(path: string): CalibratedLinearModel | null {
+  try {
+    const raw = JSON.parse(readFileSync(path, 'utf8'))
+    if (!raw.model || raw.model.kind !== 'ridge_logistic_platt') return null
+    return raw.model as CalibratedLinearModel
+  } catch { return null }
 }
