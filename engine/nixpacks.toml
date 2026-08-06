@@ -3,6 +3,6 @@
 # The default archive would otherwise pick the latest Node (e.g. 24) and a patch that may not satisfy our dependencies.
 nixpkgsArchive = '51ad838b03a05b1de6f9f2a0fffecee64a9788ee'
 
-# Install build tooling for node-gyp / better-sqlite3 native compilation.
-# python3 + make + g++ are the same dependencies the engine/Dockerfile installs.
-aptPkgs = ["...", "python3", "make", "g++"]
+# No aptPkgs: better-sqlite3@11.10.0 ships prebuilt binaries for Node 22 linux-x64,
+# so python3/make/g++ are not needed. Installing them via apt triggered OOM on the
+# Coolify host because g++ pulls in a large dependency tree (gcc, libc6-dev, binutils…).
