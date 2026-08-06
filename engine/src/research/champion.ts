@@ -13,6 +13,7 @@ import { trainEnsemble, predictEnsemble, type EnsembleModel } from './ensemble.j
 import { analyzeFeatureImportance } from './feature-importance.js'
 import { runCPCV } from './cpcv.js'
 import { fitAnomalyModel, type AnomalyModel } from '../quant/anomaly.js'
+import { bayesianModelAverage, bmaSizeMultiplier, type BMAResult, type ModelCandidate } from './bma.js'
 
 export interface ChampionState {
   modelId: string | null
@@ -45,6 +46,8 @@ export class ChampionService {
   featureImportance: { featureName: string; mutualInfo: number; keep: boolean }[] = []
   /** CPCV validation result from last retrain */
   cpcvResult: { meanBrier: number; stdBrier: number; brierLow: number; brierHigh: number; meanAccuracy: number } | null = null
+  /** Latest BMA result (populated when bmaPredict is called) */
+  bmaResult: BMAResult | null = null
 
   constructor(private readonly store: DurableStore) {}
 
@@ -408,6 +411,58 @@ export class ChampionService {
     } catch {
       return null
     }
+  }
+
+  /** Predict using Bayesian Model Averaging across all viable models.
+   *
+   * Gathers the current champion plus recently retired models that still
+   * have artifacts on disk, weights them by validation Brier, and produces
+   * a consensus prediction. This is more robust than a single-model
+   * prediction because model disagreement reduces position size.
+   */
+  bmaPredict(features: number[]): BMAResult | null {
+    const candidates: ModelCandidate[] = []
+
+    // Current champion
+    if (this.state.artifact && this.state.modelId) {
+      const metrics = this.store.getModel(this.state.modelId)
+      candidates.push({
+        id: this.state.modelId,
+        displayName: this.state.displayName ?? this.state.version ?? 'champion',
+        generation: this.state.generation,
+        validationBrier: this.state.artifact.validationBrier ?? (typeof metrics?.metrics_json?.validationBrier === 'number' ? metrics.metrics_json.validationBrier : null),
+        model: this.state.artifact,
+        isEnsemble: false,
+      })
+    }
+
+    // Recently retired models with artifacts (max 4 for performance)
+    const retired = this.store.listModelsByState('retired')
+      .filter((m) => m.artifact_path && m.id !== this.state.modelId)
+      .slice(0, 4)
+
+    for (const m of retired) {
+      const artifact = loadCalibratedModel(m.artifact_path!)
+      if (!artifact) continue
+      const brier = (m.metrics_json as { validationBrier?: number }).validationBrier ?? artifact.validationBrier ?? null
+      candidates.push({
+        id: m.id,
+        displayName: m.display_name ?? m.version,
+        generation: m.generation,
+        validationBrier: brier,
+        model: artifact,
+        isEnsemble: false,
+      })
+    }
+
+    if (candidates.length === 0) return null
+
+    const result = bayesianModelAverage(candidates, features)
+    this.bmaResult = result
+    if (result) {
+      log.info('bma', `consensus=${result.consensus} pred=${result.prediction.toFixed(3)} conf=${result.confidence.toFixed(2)} agree=${result.agreement}/${result.totalModels} size=${bmaSizeMultiplier(result).toFixed(2)}`)
+    }
+    return result
   }
 
   private computeStats(closed: { net_r: number | null }[]): CanaryStats {

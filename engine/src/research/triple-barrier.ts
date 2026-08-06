@@ -33,6 +33,12 @@ export const DEFAULT_BARRIER_CONFIG: TripleBarrierConfig = {
   maxBars: 48,
 }
 
+export interface TripleBarrierResult {
+  event: BarrierEvent
+  label: 0 | 0.5 | 1
+  metaLabel: 0 | 1
+}
+
 export interface BarrierEvent {
   /** which barrier was hit: 'tp' | 'sl' | 'time' */
   barrier: 'tp' | 'sl' | 'time'
@@ -64,7 +70,7 @@ export function applyTripleBarrier(
   lows: number[],
   closes: number[],
   config: TripleBarrierConfig = DEFAULT_BARRIER_CONFIG,
-): { event: BarrierEvent; label: 0 | 0.5 | 1; metaLabel: 0 | 1 } {
+): TripleBarrierResult {
   const rDistance = Math.abs(entryPrice - stopPrice)
   if (rDistance <= 0) {
     return {

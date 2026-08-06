@@ -40,7 +40,8 @@ import { evaluateStrategies, type StrategyCandidate } from './strategies/registr
 import { createPaperPlan, processPaperBar, submitPaperPlan } from './paper/broker.js'
 import { assessPaperRisk, DEFAULT_RISK_POLICY } from './paper/risk.js'
 import type { PaperTrade } from './paper/types.js'
-import { ResearchLab } from './research/lab.js'
+import { ResearchLab, CAMPAIGN_CONFIGS } from './research/lab.js'
+import type { CampaignType } from './research/lab.js'
 import { ChampionService } from './research/champion.js'
 import { fetchMarketContext, getCachedMarketContext, type MarketContext } from './quant/market-context.js'
 import { buildFeatureVector, FEATURE_ORDER } from './research/features.js'
@@ -52,6 +53,7 @@ import { RegimeDetector, type RegimeInfo } from './quant/regime.js'
 import { fitAnomalyModel, detectAnomaly, type AnomalyModel, type AnomalyResult } from './quant/anomaly.js'
 import { computeKellySize, estimateUncertainty, type KellyResult } from './quant/kelly.js'
 import { explainPrediction, type ExplanationResult } from './research/explain.js'
+import { bmaSizeMultiplier, type BMAResult } from './research/bma.js'
 import { createMetaPlaybookModel, recordPlaybookOutcome, adjustPlaybooksForRegime, serializeMetaPlaybook, deserializeMetaPlaybook, type MetaPlaybookModel } from './research/meta-playbook.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
@@ -263,6 +265,7 @@ export class Runtime {
   anomalyResult: AnomalyResult | null = null
   kellyResult: KellyResult | null = null
   explanation: ExplanationResult | null = null
+  bmaResult: BMAResult | null = null
   metaPlaybook: MetaPlaybookModel = createMetaPlaybookModel()
 
   constructor() {
@@ -757,15 +760,30 @@ export class Runtime {
           this.explanation = explainPrediction(this.champion.model, features, [...FEATURE_ORDER] as string[])
         } catch { /* feature count mismatch on first run */ }
       }
+      // BMA: Bayesian Model Averaging across champion + retired models
+      const bma = this.champion.bmaPredict(features)
+      this.bmaResult = bma
+      if (bma) {
+        if (bma.consensus === 'skip') {
+          analysis.vetoes.push({ id: 'bma_skip', reason: `BMA: models disagree (${bma.agreement}/${bma.totalModels} agree)`, severity: 'hard' })
+          analysis.decision = 'WAIT'
+          log.info('bma', `${instId} trade skipped: models disagree (${bma.agreement}/${bma.totalModels})`)
+        } else if (analysis.plan) {
+          // Override win probability with BMA weighted prediction
+          analysis.plan.winProbability = bma.prediction
+          log.info('bma', `${instId} consensus=${bma.consensus} pred=${bma.prediction.toFixed(3)} conf=${bma.confidence.toFixed(2)} agree=${bma.agreement}/${bma.totalModels}`)
+        }
+      }
       // Kelly sizing: compute optimal position size
       if (analysis.plan) {
+        const bmaSizeMod = bma ? bmaSizeMultiplier(bma) : 1
         const uncertainty = estimateUncertainty(analysis.plan.winProbability ?? 0.5)
         this.kellyResult = computeKellySize({
           winProbability: analysis.plan.winProbability ?? 0.5,
           avgWinR: analysis.plan.expectedRr ?? 2,
           avgLossR: 1,
           uncertainty,
-          regimeMultiplier: this.regime?.sizeMultiplier ?? 1,
+          regimeMultiplier: (this.regime?.sizeMultiplier ?? 1) * bmaSizeMod,
           consecutiveLosses: this.consecutiveLosses(instId),
           currentDrawdownR: this.currentDrawdownR(instId),
           maxDrawdownR: 8,
@@ -1310,12 +1328,24 @@ export class Runtime {
     if (latest && Date.now() - latest < intervalMs) return
     const governor = this.research.governor()
     if (!governor.allowed) return
-    log.info('research', 'starting scheduled BTC/ETH walk-forward campaign')
+
+    // Rotate through campaign types for systematic exploration
+    const campaignTypes: CampaignType[] = [
+      'baseline', 'multi_symbol', 'ensemble', 'triple_barrier',
+      'feature_rich', 'high_conviction', 'low_conviction', 'regime_aware',
+    ]
+    const recentTypes = state.campaigns
+      .slice(-8)
+      .map((c) => (c.manifest as Record<string, unknown>)?.campaignType as string | undefined)
+      .filter(Boolean) as string[]
+    const nextType = campaignTypes.find((t) => !recentTypes.includes(t)) ?? campaignTypes[0]
+
+    log.info('research', `starting scheduled ${nextType} campaign`)
     const result = await this.research.run({
-      symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'], timeframe: '15m', maxEvaluations: 80,
-      hypothesis: 'Scheduled confirmation: explicit playbooks retain positive net R across purged folds and held-out ETH.',
+      type: nextType as CampaignType,
+      hypothesis: `Scheduled ${nextType} campaign: ${CAMPAIGN_CONFIGS[nextType as CampaignType]?.hypothesis ?? 'exploratory'}`,
     })
-    log.info('research', `scheduled campaign ${result.status}: ${result.validationState}`)
+    log.info('research', `scheduled ${nextType} campaign ${result.status}: ${result.validationState} — ${result.promotionReasons.join(', ') || 'all gates passed'}`)
   }
 
   /** Legacy Convex journal is retained read-only; SQLite paper events are the execution truth. */
@@ -1540,6 +1570,7 @@ export class Runtime {
         anomaly: this.anomalyResult ? { isAnomaly: this.anomalyResult.isAnomaly, action: this.anomalyResult.action, score: this.anomalyResult.anomalyScore } : null,
         kelly: this.kellyResult ? { sizeMultiplier: this.kellyResult.sizeMultiplier, riskFraction: this.kellyResult.riskFraction } : null,
         explanation: this.explanation ? { summary: this.explanation.summary, topReasons: this.explanation.topReasons.slice(0, 3) } : null,
+        bma: this.bmaResult ? { consensus: this.bmaResult.consensus, prediction: this.bmaResult.prediction, confidence: this.bmaResult.confidence, agreement: this.bmaResult.agreement, totalModels: this.bmaResult.totalModels } : null,
         featureImportance: this.champion.featureImportance.slice(0, 5),
         cpcv: this.champion.cpcvResult,
       },
