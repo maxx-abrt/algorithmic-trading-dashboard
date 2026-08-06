@@ -161,11 +161,11 @@ describe('buildRiskPlan champion blend', () => {
   it('blends champion model probability into winProbability', () => {
     const indicators = mkIndicators()
     const settings: EngineSettings = { ...DEFAULT_SETTINGS, instId: 'BTC-USDT-SWAP' }
-    // Train with 15 features to match the expanded feature vector
+    // Train with 32 features to match the expanded feature vector
     const rows = Array.from({ length: 48 }, (_, index) => ({
       at: index * 60_000,
       symbol: 'BTC',
-      features: [index / 48, Math.sin(index / 5), index % 3, index / 100, 0.5, 1.2, 0.6, 0.5, 0.1, 0.52, 0.3, 0.0, 0.1, 0.05, 0.1],
+      features: Array.from({ length: 32 }, (_, fi) => (index / 48 + fi * 0.01 + Math.sin(index / 5 + fi)) % 1),
       label: (index > 22 ? 1 : 0) as 0 | 1,
     }))
     const championModel = trainCalibratedLinear(rows, { trainFraction: 0.75 })!

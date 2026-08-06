@@ -366,6 +366,17 @@ const routes: Record<string, Handler> = {
     })
   },
 
+  'GET /api/research/edge': () => ({
+    regime: runtime.regime,
+    volForecast: runtime.volForecast,
+    crossAsset: runtime.crossAsset,
+    onChain: runtime.onChain,
+    orderBook: runtime.orderBook.get(runtime.settings.instId) ?? null,
+    anomaly: runtime.anomalyResult,
+    explanation: runtime.explanation,
+    kelly: runtime.kellyResult,
+  }),
+
   'GET /api/operations': () => ({
     health: runtime.health(),
     qualityEvents: runtime.store.listQualityEvents(100),

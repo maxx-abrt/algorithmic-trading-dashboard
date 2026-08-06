@@ -28,7 +28,7 @@ import { OkxStream } from './okx/ws.js'
 import { candleStore } from './store/candles.js'
 import { analyze, quickScore, type QuickScore } from './quant/engine.js'
 import { higherTimeframes, normalizeBar } from './quant/timeframes.js'
-import type { Analysis, DerivativesBlock, EngineSettings, InstrumentSpec } from './quant/types.js'
+import type { Analysis, Candle, DerivativesBlock, EngineSettings, InstrumentSpec } from './quant/types.js'
 import { DEFAULT_SETTINGS } from './quant/types.js'
 import { GeminiOrchestrator, type AiConfig } from './ai/gemini.js'
 import { TelegramBot } from './telegram/bot.js'
@@ -44,6 +44,15 @@ import { ResearchLab } from './research/lab.js'
 import { ChampionService } from './research/champion.js'
 import { fetchMarketContext, getCachedMarketContext, type MarketContext } from './quant/market-context.js'
 import { buildFeatureVector, FEATURE_ORDER } from './research/features.js'
+import { getCrossAssetData, getCachedCrossAssetData, type CrossAssetData } from './quant/cross-asset.js'
+import { getOnChainData, getCachedOnChainData, type OnChainData } from './quant/onchain.js'
+import { fetchOrderBook, type OrderBookSnapshot } from './quant/orderbook.js'
+import { forecastVolatility, type VolForecast } from './quant/vol-forecast.js'
+import { RegimeDetector, type RegimeInfo } from './quant/regime.js'
+import { fitAnomalyModel, detectAnomaly, type AnomalyModel, type AnomalyResult } from './quant/anomaly.js'
+import { computeKellySize, estimateUncertainty, type KellyResult } from './quant/kelly.js'
+import { explainPrediction, type ExplanationResult } from './research/explain.js'
+import { createMetaPlaybookModel, recordPlaybookOutcome, adjustPlaybooksForRegime, serializeMetaPlaybook, deserializeMetaPlaybook, type MetaPlaybookModel } from './research/meta-playbook.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
 /* -------------------------------------------------------------------------- */
@@ -244,6 +253,17 @@ export class Runtime {
   bot: TelegramBot
   universeLoadedAt = 0
   marketContext: MarketContext | null = null
+  crossAsset: CrossAssetData | null = null
+  onChain: OnChainData | null = null
+  orderBook: Map<string, OrderBookSnapshot> = new Map()
+  volForecast: VolForecast | null = null
+  regime: RegimeInfo | null = null
+  regimeDetector = new RegimeDetector()
+  anomalyModel: AnomalyModel | null = null
+  anomalyResult: AnomalyResult | null = null
+  kellyResult: KellyResult | null = null
+  explanation: ExplanationResult | null = null
+  metaPlaybook: MetaPlaybookModel = createMetaPlaybookModel()
 
   constructor() {
     candleStore.attachDurableStore(this.store)
@@ -282,6 +302,7 @@ export class Runtime {
     await this.seedDefaults()
     this.champion.loadFromStore()
     this.champion.loadCanaryFromStore()
+    this.loadMetaPlaybook()
     this.stream.connect()
     this.syncSubscriptions()
 
@@ -311,6 +332,12 @@ export class Runtime {
     every(30 * 60_000, () => this.autoResearchLoop(), 'auto-research')
     every(10 * 60_000, () => this.championLoop(), 'champion-lifecycle')
     every(15 * 60_000, () => this.refreshMarketContext(), 'market-context')
+    every(15 * 60_000, () => this.refreshCrossAsset(), 'cross-asset')
+    every(30 * 60_000, () => this.refreshOnChain(), 'on-chain')
+    every(10_000, () => this.refreshOrderBook(), 'order-book')
+    every(60_000, () => this.refreshVolForecast(), 'vol-forecast')
+    every(30_000, () => this.refreshRegime(), 'regime-detect')
+    every(30 * 60_000, () => this.saveMetaPlaybook(), 'meta-playbook')
     every(30_000, () => this.telemetryLoop(), 'telemetry')
     every(5_000, () => log.flush(), 'logflush')
     every(60_000, () => this.refreshAccount(), 'account')
@@ -457,6 +484,77 @@ export class Runtime {
     }
   }
 
+  async refreshCrossAsset() {
+    try {
+      this.crossAsset = await getCrossAssetData()
+    } catch (err) {
+      log.error('cross-asset', err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  async refreshOnChain() {
+    try {
+      this.onChain = await getOnChainData()
+    } catch (err) {
+      log.error('onchain', err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  async refreshOrderBook() {
+    if (!this.settings.engineEnabled) return
+    try {
+      const instId = this.settings.instId
+      const snapshot = await fetchOrderBook(instId)
+      if (snapshot) this.orderBook.set(instId, snapshot)
+    } catch { /* graceful */ }
+  }
+
+  refreshVolForecast() {
+    try {
+      const instId = this.settings.instId
+      const candles = candleStore.peek(instId, this.settings.timeframe)
+      if (!candles || candles.length < 30) return
+      const returns = candles.slice(-100).map((c: Candle) => (c.close - c.open) / c.open)
+      const atrPct = this.analyses.get(this.settings.instId)?.indicators?.volatility?.atrPct
+      this.volForecast = forecastVolatility(returns, { atrPct })
+    } catch { /* graceful */ }
+  }
+
+  refreshRegime() {
+    try {
+      const instId = this.settings.instId
+      const analysis = this.analyses.get(instId)
+      if (!analysis?.indicators) return
+      const i = analysis.indicators
+      const features = {
+        atrPct: i.volatility.atrPct,
+        adx: i.trend.adx,
+        rsi: i.momentum.rsi,
+        return20: (i.price - i.ma.ema21) / i.ma.ema21 * 100,
+        volumeRatio: i.volume.volumeRatio,
+        hurst: i.stats.hurst,
+      }
+      this.regimeDetector.update(features)
+      this.regime = this.regimeDetector.classify(features)
+    } catch { /* graceful */ }
+  }
+
+  saveMetaPlaybook() {
+    try {
+      this.store.setState('meta_playbook', serializeMetaPlaybook(this.metaPlaybook))
+    } catch { /* graceful */ }
+  }
+
+  loadMetaPlaybook() {
+    try {
+      const json = this.store.getState<string | null>('meta_playbook', null)
+      if (json) {
+        const model = deserializeMetaPlaybook(json)
+        if (model) this.metaPlaybook = model
+      }
+    } catch { /* graceful */ }
+  }
+
   async refreshAccount() {
     if (!HAS_OKX_KEYS || !this.settings.useAccountBalance) return
     try {
@@ -538,6 +636,36 @@ export class Runtime {
     return `${instId}|${normalizeBar(timeframe)}`
   }
 
+  /** Count consecutive losing paper trades for an instrument. */
+  private consecutiveLosses(instId: string): number {
+    const trades = this.store.listTrades(50, 'closed')
+      .filter((t) => t.plan.instId === instId && t.netRealizedR != null)
+      .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
+    let count = 0
+    for (const t of trades) {
+      if ((t.netRealizedR ?? 0) > 0) break
+      count++
+    }
+    return count
+  }
+
+  /** Current drawdown in R for an instrument. */
+  private currentDrawdownR(instId: string): number {
+    const trades = this.store.listTrades(100, 'closed')
+      .filter((t) => t.plan.instId === instId && t.netRealizedR != null)
+      .sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0))
+    if (trades.length === 0) return 0
+    let peak = 0
+    let cumulative = 0
+    let maxDD = 0
+    for (const t of trades) {
+      cumulative += t.netRealizedR ?? 0
+      peak = Math.max(peak, cumulative)
+      maxDD = Math.max(maxDD, peak - cumulative)
+    }
+    return maxDD
+  }
+
   /**
    * Full pipeline for one instrument: warm candles for three timeframes, pull
    * the derivatives context, run the quant brain, optionally ask the LLM, then
@@ -583,12 +711,69 @@ export class Runtime {
       availableUsd: this.account?.availableUsdt ?? null,
       championModel: this.champion.model,
       marketContext: this.marketContext,
+      crossAsset: this.crossAsset,
+      onChain: this.onChain,
+      orderBook: this.orderBook.get(instId) ?? null,
+      volForecast: this.volForecast,
+      regimeInfo: this.regime,
     })
     this.counters.evaluations++
 
     const k = this.key(instId, timeframe)
     const prev = this.analyses.get(k) ?? null
     if (prev) this.previous.set(k, prev)
+
+    /* ---- Cutting-edge: anomaly detection, Kelly sizing, explainability ---- */
+    if (analysis.decision !== 'WAIT' && this.champion.anomalyModel) {
+      const candidates = evaluateStrategies(analysis)
+      const selected = candidates.find((c) => c.eligible && c.side === (analysis.decision === 'WAIT' ? analysis.bias === 'BULLISH' ? 'LONG' : 'SHORT' : analysis.decision))
+      const features = buildFeatureVector({
+        compositeScore: analysis.compositeScore,
+        mtfAlignment: analysis.mtfAlignment,
+        indicators: analysis.indicators,
+        playbookScore: selected?.score ?? 0,
+        marketContext: analysis.marketContext,
+        derivatives: analysis.derivatives,
+        crossAsset: this.crossAsset,
+        onChain: this.onChain,
+        orderBook: this.orderBook.get(instId) ?? null,
+        volForecast: this.volForecast,
+        regime: this.regime,
+      })
+      // Anomaly detection: veto trades in unknown market conditions
+      const anomaly = detectAnomaly(this.champion.anomalyModel, features)
+      this.anomalyResult = anomaly
+      if (anomaly.action === 'skip') {
+        analysis.vetoes.push({ id: 'anomaly_skip', reason: `anomaly: ${anomaly.reason}`, severity: 'hard' })
+        analysis.decision = 'WAIT'
+        log.info('anomaly', `${instId} trade skipped: ${anomaly.reason}`)
+      } else if (anomaly.action === 'reduce') {
+        analysis.vetoes.push({ id: 'anomaly_reduce', reason: `anomaly: ${anomaly.reason}`, severity: 'soft' })
+        log.info('anomaly', `${instId} trade caution: ${anomaly.reason}`)
+      }
+      // Explainability: generate feature contribution breakdown
+      if (this.champion.model) {
+        try {
+          this.explanation = explainPrediction(this.champion.model, features, [...FEATURE_ORDER] as string[])
+        } catch { /* feature count mismatch on first run */ }
+      }
+      // Kelly sizing: compute optimal position size
+      if (analysis.plan) {
+        const uncertainty = estimateUncertainty(analysis.plan.winProbability ?? 0.5)
+        this.kellyResult = computeKellySize({
+          winProbability: analysis.plan.winProbability ?? 0.5,
+          avgWinR: analysis.plan.expectedRr ?? 2,
+          avgLossR: 1,
+          uncertainty,
+          regimeMultiplier: this.regime?.sizeMultiplier ?? 1,
+          consecutiveLosses: this.consecutiveLosses(instId),
+          currentDrawdownR: this.currentDrawdownR(instId),
+          maxDrawdownR: 8,
+          volForecast: this.volForecast?.normalized ?? 0.5,
+        })
+        log.info('kelly', `${instId} size=${this.kellyResult.sizeMultiplier.toFixed(2)}x risk=${(this.kellyResult.riskFraction * 100).toFixed(2)}% — ${this.kellyResult.reasons.slice(-1)[0]}`)
+      }
+    }
 
     /* ---- AI arbitration, strictly gated ------------------------------- */
     const ai = this.settings.ai
@@ -627,6 +812,37 @@ export class Runtime {
     }
 
     this.analyses.set(k, analysis)
+
+    // Meta-playbook: adjust candidate scores based on regime-conditional historical performance
+    if (this.regime && analysis.decision !== 'WAIT') {
+      const candidates = evaluateStrategies(analysis)
+      const adjustments = adjustPlaybooksForRegime(
+        this.metaPlaybook,
+        this.regime.id,
+        candidates.map((c) => ({ playbookId: c.playbook, score: c.score })),
+      )
+      const topAdjust = adjustments.find((a) => Math.abs(a.adjustedScore - a.originalScore) > 5)
+      if (topAdjust) {
+        log.info('meta-playbook', `${instId} regime ${this.regime!.id}: ${topAdjust.playbookId} ${topAdjust.originalScore.toFixed(0)}→${topAdjust.adjustedScore.toFixed(0)} (${topAdjust.reason})`)
+      }
+    }
+
+    // Add explainability to narrative
+    if (this.explanation && analysis.decision !== 'WAIT') {
+      analysis.narrative.push(`── Explainability ──`)
+      analysis.narrative.push(this.explanation.summary)
+      for (const reason of this.explanation.topReasons.slice(0, 3)) {
+        analysis.narrative.push(`  • ${reason}`)
+      }
+    }
+    // Add regime info to narrative
+    if (this.regime) {
+      analysis.narrative.push(`── Regime: ${this.regime.label} (${(this.regime.confidence * 100).toFixed(0)}% confidence, ${this.regime.sizeMultiplier}x size) ──`)
+    }
+    // Add Kelly sizing to narrative
+    if (this.kellyResult && analysis.plan) {
+      analysis.narrative.push(`── Kelly sizing: ${this.kellyResult.sizeMultiplier.toFixed(2)}x size, ${(this.kellyResult.riskFraction * 100).toFixed(2)}% risk ──`)
+    }
 
     if (!opts.silent) {
       await this.postAnalysis(analysis, prev)
@@ -923,6 +1139,11 @@ export class Runtime {
             playbookScore: selected?.score ?? 0,
             marketContext: analysis.marketContext,
             derivatives: analysis.derivatives,
+            crossAsset: this.crossAsset,
+            onChain: this.onChain,
+            orderBook: this.orderBook.get(trade.plan.instId) ?? null,
+            volForecast: this.volForecast,
+            regime: this.regime,
           })
           const trainingModelId = this.champion.current.modelId ?? 'baseline'
           this.champion.recordTrainingRow({
@@ -935,6 +1156,20 @@ export class Runtime {
             netR: trade.netRealizedR,
             tradeId: trade.id,
           })
+        }
+        // Record meta-playbook outcome for regime-conditional learning
+        if (analysis && this.regime) {
+          const candidates = evaluateStrategies(analysis)
+          const selected = candidates.find((c) => c.eligible && c.side === trade.plan.side)
+          if (selected) {
+            recordPlaybookOutcome(
+              this.metaPlaybook,
+              selected.playbook,
+              this.regime.id,
+              trade.netRealizedR > 0,
+              trade.netRealizedR,
+            )
+          }
         }
         // Close canary trade if this was a canary
         if (this.champion.canaryId) {
@@ -968,6 +1203,8 @@ export class Runtime {
       if (evaluation.shouldPromote) {
         log.info('champion', `auto-promoting canary ${this.champion.canaryId}: ${evaluation.reasons.join(', ')}`)
         this.champion.promoteCanary(this.champion.canaryId)
+        // Sync anomaly model from champion to runtime after promotion
+        this.anomalyModel = this.champion.anomalyModel
       } else if (evaluation.reasons.some((r) => r.includes('canary_expired_by_age'))) {
         log.info('champion', `canary expired by age, retiring: ${evaluation.reasons.join(', ')}`)
         this.store.retireModel(this.champion.canaryId, 'canary_expired', 'retired')
@@ -1009,7 +1246,9 @@ export class Runtime {
         const result = this.champion.retrainChampion()
         if (result.accepted) {
           this.store.setState('last_champion_retrain', Date.now())
-          log.info('champion', `retrain accepted: ${result.reason}`)
+          // Sync anomaly model from champion to runtime
+          this.anomalyModel = this.champion.anomalyModel
+          log.info('champion', `retrain accepted: ${result.reason} (anomaly model synced, features: ${this.champion.featureImportance.length})`)
         } else {
           log.info('champion', `retrain skipped: ${result.reason}`)
           // Still update the timestamp so we don't retry every 10 min
@@ -1293,6 +1532,17 @@ export class Runtime {
       okxKeys: HAS_OKX_KEYS,
       analyses: this.analyses.size,
       marketContext: this.marketContext,
+      edge: {
+        regime: this.regime,
+        volForecast: this.volForecast,
+        crossAsset: this.crossAsset ? { vix: this.crossAsset.vix, riskScore: this.crossAsset.riskScore } : null,
+        onChain: this.onChain ? { score: this.onChain.onChainScore, hashRate: this.onChain.hashRate } : null,
+        anomaly: this.anomalyResult ? { isAnomaly: this.anomalyResult.isAnomaly, action: this.anomalyResult.action, score: this.anomalyResult.anomalyScore } : null,
+        kelly: this.kellyResult ? { sizeMultiplier: this.kellyResult.sizeMultiplier, riskFraction: this.kellyResult.riskFraction } : null,
+        explanation: this.explanation ? { summary: this.explanation.summary, topReasons: this.explanation.topReasons.slice(0, 3) } : null,
+        featureImportance: this.champion.featureImportance.slice(0, 5),
+        cpcv: this.champion.cpcvResult,
+      },
     }
   }
 

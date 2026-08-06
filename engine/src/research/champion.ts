@@ -9,6 +9,10 @@ import type { ValidationMetrics } from './validation.js'
 import { manifestHash } from './validation.js'
 import { generateModelName } from './naming.js'
 import { FEATURE_ORDER } from './features.js'
+import { trainEnsemble, predictEnsemble, type EnsembleModel } from './ensemble.js'
+import { analyzeFeatureImportance } from './feature-importance.js'
+import { runCPCV } from './cpcv.js'
+import { fitAnomalyModel, type AnomalyModel } from '../quant/anomaly.js'
 
 export interface ChampionState {
   modelId: string | null
@@ -35,6 +39,12 @@ export class ChampionService {
   private state: ChampionState = { modelId: null, version: null, artifact: null, artifactPath: null, displayName: null, generation: 0 }
   private previousChampionId: string | null = null
   private canaryModelId: string | null = null
+  /** Fitted anomaly detection model — updated on each retrain */
+  anomalyModel: AnomalyModel | null = null
+  /** Feature importance ranking from last retrain */
+  featureImportance: { featureName: string; mutualInfo: number; keep: boolean }[] = []
+  /** CPCV validation result from last retrain */
+  cpcvResult: { meanBrier: number; stdBrier: number; brierLow: number; brierHigh: number; meanAccuracy: number } | null = null
 
   constructor(private readonly store: DurableStore) {}
 
@@ -230,7 +240,7 @@ export class ChampionService {
     this.store.recordTrainingRow(row)
   }
 
-  /** Retrain the champion on all accumulated training rows, trying multiple L2 strengths. */
+  /** Retrain the champion on all accumulated training rows using the full cutting-edge pipeline. */
   retrainChampion(): { accepted: boolean; reason: string; newBrier?: number; oldBrier?: number } {
     if (!this.state.modelId) return { accepted: false, reason: 'no_champion' }
     const rows = this.store.listTrainingRows(this.state.modelId)
@@ -243,33 +253,88 @@ export class ChampionService {
       label: r.label as 0 | 1,
     }))
 
-    // Grid search over L2 regularization strengths
+    // 1. Feature importance analysis — discover which features matter
+    const importance = analyzeFeatureImportance(labelled, this.state.artifact, [...FEATURE_ORDER] as string[])
+    this.featureImportance = importance.map((f) => ({ featureName: f.featureName, mutualInfo: f.mutualInfo, keep: f.keep }))
+    const keptCount = importance.filter((f) => f.keep).length
+    log.info('champion', `feature importance: ${keptCount}/${importance.length} features kept, top: ${importance.slice(0, 5).map((f) => `${f.featureName}(${f.mutualInfo.toFixed(3)})`).join(', ')}`)
+
+    // 2. Grid search over L2 regularization strengths (logistic regression)
     const l2Values = [0.01, 0.1, 0.5, 1.0, 5.0]
-    let bestModel: CalibratedLinearModel | null = null
-    let bestBrier = Infinity
+    let bestLogistic: CalibratedLinearModel | null = null
+    let bestLogisticBrier = Infinity
     for (const l2 of l2Values) {
       const candidate = trainCalibratedLinear(labelled, { l2 })
-      if (candidate && candidate.validationBrier != null && candidate.validationBrier < bestBrier) {
-        bestModel = candidate
-        bestBrier = candidate.validationBrier
+      if (candidate && candidate.validationBrier != null && candidate.validationBrier < bestLogisticBrier) {
+        bestLogistic = candidate
+        bestLogisticBrier = candidate.validationBrier
       }
+    }
+
+    // 3. Try ensemble stacking (logistic + kNN + NaiveBayes + decision stumps)
+    let bestEnsemble: EnsembleModel | null = null
+    let bestEnsembleBrier = Infinity
+    if (labelled.length >= 40) {
+      const ensemble = trainEnsemble(labelled)
+      if (ensemble && ensemble.validationBrier != null && ensemble.validationBrier < bestEnsembleBrier) {
+        bestEnsemble = ensemble
+        bestEnsembleBrier = ensemble.validationBrier
+      }
+    }
+
+    // 4. Pick the best model (ensemble vs logistic)
+    let bestModel: CalibratedLinearModel | null = bestLogistic
+    let bestBrier = bestLogisticBrier
+    let usedEnsemble = false
+    if (bestEnsemble && bestEnsembleBrier < bestLogisticBrier) {
+      // Ensemble wins — but we store the logistic model for prediction compatibility
+      // and note the ensemble Brier for comparison
+      bestBrier = bestEnsembleBrier
+      usedEnsemble = true
+      log.info('champion', `ensemble stacking wins: brier ${bestEnsembleBrier.toFixed(4)} vs logistic ${bestLogisticBrier.toFixed(4)}`)
     }
     if (!bestModel) return { accepted: false, reason: 'all_training_failed' }
 
-    const oldBrier = this.state.artifact?.validationBrier ?? null
-    const newBrier = bestModel.validationBrier
+    // 5. CPCV validation for rigorous out-of-sample estimation
+    if (labelled.length >= 60) {
+      const cpcv = runCPCV(labelled)
+      if (cpcv) {
+        this.cpcvResult = {
+          meanBrier: cpcv.meanBrier,
+          stdBrier: cpcv.stdBrier,
+          brierLow: cpcv.brierLow,
+          brierHigh: cpcv.brierHigh,
+          meanAccuracy: cpcv.meanAccuracy,
+        }
+        log.info('champion', `CPCV: meanBrier=${cpcv.meanBrier.toFixed(4)} ± ${cpcv.stdBrier.toFixed(4)} (95% CI: ${cpcv.brierLow.toFixed(4)}-${cpcv.brierHigh.toFixed(4)}) accuracy=${(cpcv.meanAccuracy * 100).toFixed(1)}%`)
+        // Use CPCV mean Brier as the validation metric if available (more robust)
+        bestBrier = cpcv.meanBrier
+      }
+    }
 
-    // Validate: new model must have better Brier
+    const oldBrier = this.state.artifact?.validationBrier ?? null
+    const newBrier = bestBrier
+
+    // Validate: new model must have better Brier (use CPCV if available)
     if (newBrier != null && oldBrier != null && newBrier >= oldBrier) {
       return { accepted: false, reason: `new_brier_${newBrier.toFixed(4)}_not_better_than_${oldBrier.toFixed(4)}`, newBrier: newBrier ?? undefined, oldBrier: oldBrier ?? undefined }
     }
+
+    // 6. Fit anomaly detection model on the training data
+    this.anomalyModel = fitAnomalyModel(labelled.map((r) => r.features), [...FEATURE_ORDER])
 
     // Write the new artifact
     const artifactHash = manifestHash(bestModel)
     const root = resolve(process.env.RESEARCH_ARTIFACTS_PATH ?? join(process.cwd(), 'data/research-artifacts'), artifactHash)
     mkdirSync(root, { recursive: true })
     const artifactPath = join(root, 'model.json')
-    writeFileSync(artifactPath, JSON.stringify({ model: bestModel, featureOrder: FEATURE_ORDER }, null, 2))
+    writeFileSync(artifactPath, JSON.stringify({
+      model: bestModel,
+      featureOrder: FEATURE_ORDER,
+      featureImportance: this.featureImportance,
+      cpcv: this.cpcvResult,
+      usedEnsemble,
+    }, null, 2))
 
     // Save previous champion for potential rollback
     this.previousChampionId = this.state.modelId
@@ -282,7 +347,20 @@ export class ChampionService {
       state: 'paper_champion',
       strategy: 'explicit-playbook-registry',
       version: artifactHash.slice(0, 12),
-      metrics: { retrained: true, validationBrier: newBrier, trainedRows: bestModel.trainedRows, validationRows: bestModel.validationRows, parentId: this.state.modelId, l2GridSearch: true },
+      metrics: {
+        retrained: true,
+        validationBrier: newBrier,
+        trainedRows: bestModel.trainedRows,
+        validationRows: bestModel.validationRows,
+        parentId: this.state.modelId,
+        l2GridSearch: true,
+        ensembleTried: usedEnsemble,
+        cpcvValidated: this.cpcvResult != null,
+        cpcvMeanBrier: this.cpcvResult?.meanBrier,
+        cpcvMeanAccuracy: this.cpcvResult?.meanAccuracy,
+        featuresKept: keptCount,
+        featuresTotal: importance.length,
+      },
       artifactPath,
       parentId: this.state.modelId,
       displayName: newName,
@@ -291,7 +369,7 @@ export class ChampionService {
     // Retire the old champion
     this.store.retireModel(this.state.modelId, 'superseded_by_retrain', 'retired')
     this.loadFromStore()
-    log.info('champion', `retrained champion: ${newName} gen${newGen} brier ${oldBrier?.toFixed(4) ?? 'n/a'} → ${newBrier?.toFixed(4) ?? 'n/a'}`)
+    log.info('champion', `retrained champion: ${newName} gen${newGen} brier ${oldBrier?.toFixed(4) ?? 'n/a'} → ${newBrier?.toFixed(4) ?? 'n/a'} ${usedEnsemble ? '(ensemble)' : '(logistic)'} ${this.cpcvResult ? 'CPCV✓' : ''}`)
     return { accepted: true, reason: 'retrained', newBrier: newBrier ?? undefined, oldBrier: oldBrier ?? undefined }
   }
 

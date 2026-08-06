@@ -12,6 +12,11 @@ import type { SessionInfo } from './sessions'
 import type { CalibratedLinearModel } from '../research/calibration'
 import { predictCalibrated } from '../research/calibration'
 import { buildFeatureVector } from '../research/features'
+import type { CrossAssetData } from './cross-asset'
+import type { OnChainData } from './onchain'
+import type { OrderBookSnapshot } from './orderbook'
+import type { VolForecast } from './vol-forecast'
+import type { RegimeInfo } from './regime'
 import type {
   DerivativesBlock,
   EngineSettings,
@@ -96,6 +101,16 @@ export interface BuildPlanInput {
   mtfAlignment?: number
   /** market context for champion feature vector */
   marketContext?: { fearGreedIndex: number | null; sentimentScore: number | null; btcDominance: number | null; marketCapChange24h: number | null } | null
+  /** cross-asset signals for expanded feature vector */
+  crossAsset?: CrossAssetData | null
+  /** on-chain metrics for expanded feature vector */
+  onChain?: OnChainData | null
+  /** order book snapshot for microstructure features */
+  orderBook?: OrderBookSnapshot | null
+  /** volatility forecast from GARCH/EWMA */
+  volForecast?: VolForecast | null
+  /** market regime classification */
+  regimeInfo?: RegimeInfo | null
 }
 
 function fmtUsd(n: number) {
@@ -332,11 +347,16 @@ export function buildRiskPlan(input: BuildPlanInput): RiskPlan {
       playbookScore: input.playbookScore ?? 0,
       marketContext: input.marketContext,
       derivatives: input.derivatives,
+      crossAsset: input.crossAsset,
+      onChain: input.onChain,
+      orderBook: input.orderBook,
+      volForecast: input.volForecast,
+      regime: input.regimeInfo,
     })
     try { modelProb = predictCalibrated(input.championModel, features) } catch { modelProb = null }
   }
   const blend = empirical != null ? clamp(edge!.confidence, 0, 0.7) : 0
-  const modelBlend = modelProb != null && input.championModel ? clamp(input.championModel.featureCount / 15, 0, 0.3) : 0
+  const modelBlend = modelProb != null && input.championModel ? clamp(input.championModel.featureCount / 32, 0, 0.35) : 0
   const totalBlend = clamp(blend + modelBlend, 0, 0.85)
   const winProbability = clamp(
     convictionProb * (1 - totalBlend) +

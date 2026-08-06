@@ -50,6 +50,11 @@ import { computeEdge, type EdgeBlock } from './edge'
 import { sessionInfo, type SessionInfo } from './sessions'
 import type { CalibratedLinearModel } from '../research/calibration'
 import type { MarketContext } from './market-context'
+import type { CrossAssetData } from './cross-asset'
+import type { OnChainData } from './onchain'
+import type { OrderBookSnapshot } from './orderbook'
+import type { VolForecast } from './vol-forecast'
+import type { RegimeInfo } from './regime'
 
 /* -------------------------------------------------------------------------- */
 /*  Per-timeframe indicator computation                                        */
@@ -504,6 +509,16 @@ export interface AnalyzeInput {
   championModel?: CalibratedLinearModel | null
   /** free API market context: fear/greed, BTC dominance, trending */
   marketContext?: MarketContext | null
+  /** cross-asset signals: VIX, DXY, SPY, Gold */
+  crossAsset?: CrossAssetData | null
+  /** on-chain metrics: hash rate, MVRV, NVT */
+  onChain?: OnChainData | null
+  /** order book snapshot for microstructure features */
+  orderBook?: OrderBookSnapshot | null
+  /** volatility forecast from GARCH/EWMA */
+  volForecast?: VolForecast | null
+  /** market regime classification */
+  regimeInfo?: RegimeInfo | null
 }
 
 export function analyze(input: AnalyzeInput): Analysis {
@@ -736,6 +751,11 @@ export function analyze(input: AnalyzeInput): Analysis {
     mtfAlignment: alignment,
     playbookScore,
     marketContext: input.marketContext ?? null,
+    crossAsset: input.crossAsset ?? null,
+    onChain: input.onChain ?? null,
+    orderBook: input.orderBook ?? null,
+    volForecast: input.volForecast ?? null,
+    regimeInfo: input.regimeInfo ?? null,
   })
   if (decision !== 'WAIT' && candidatePlan.netExpectancyR <= 0) {
     vetoes.push({ id: 'non_positive_net_expectancy', reason: `Plan expectancy is ${candidatePlan.netExpectancyR.toFixed(2)}R after estimated costs`, severity: 'hard' })
