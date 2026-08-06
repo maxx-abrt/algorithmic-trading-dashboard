@@ -906,7 +906,7 @@ export class Runtime {
     if (!governor.allowed) return
     log.info('research', 'starting scheduled BTC/ETH walk-forward campaign')
     const result = await this.research.run({
-      symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'], timeframe: '15m', maxEvaluations: 24,
+      symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'], timeframe: '15m', maxEvaluations: 80,
       hypothesis: 'Scheduled confirmation: explicit playbooks retain positive net R across purged folds and held-out ETH.',
     })
     log.info('research', `scheduled campaign ${result.status}: ${result.validationState}`)

@@ -5,7 +5,7 @@ import { loadavg } from 'node:os'
 import { fetchCandles, fetchInstruments, fetchTickers } from '../okx/market.js'
 import { analyze } from '../quant/engine.js'
 import { higherTimeframes } from '../quant/timeframes.js'
-import type { Candle, InstrumentSpec } from '../quant/types.js'
+import { DEFAULT_SETTINGS, type Candle, type InstrumentSpec } from '../quant/types.js'
 import { createPaperPlan, runPaperPlan } from '../paper/broker.js'
 import type { PaperTrade } from '../paper/types.js'
 import { evaluateStrategies } from '../strategies/registry.js'
@@ -115,7 +115,18 @@ export class ResearchLab {
             htf: htf.filter((row) => row.ts < availableAt).slice(-220),
             htf2: htf2.filter((row) => row.ts < availableAt).slice(-160),
             livePrice: signalBar.close, volUsd24h: ticker.volUsd24h, now: availableAt,
-            settings: { timeframe, htfTimeframe: htfName, htf2Timeframe: htf2Name, useDerivatives: false },
+            settings: {
+              ...DEFAULT_SETTINGS,
+              timeframe,
+              htfTimeframe: htfName,
+              htf2Timeframe: htf2Name,
+              useDerivatives: false,
+              minConfidence: 45,
+              minCompositeScore: 15,
+              minAdx: 12,
+              maxAtrPct: 12,
+              requireMtfAlignment: false,
+            },
           })
           samples.push({ at: availableAt, symbol })
           const candidates = evaluateStrategies(analysis)
