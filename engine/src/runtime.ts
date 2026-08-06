@@ -43,6 +43,7 @@ import type { PaperTrade } from './paper/types.js'
 import { ResearchLab } from './research/lab.js'
 import { ChampionService } from './research/champion.js'
 import { fetchMarketContext, getCachedMarketContext, type MarketContext } from './quant/market-context.js'
+import { buildFeatureVector, FEATURE_ORDER } from './research/features.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
 /* -------------------------------------------------------------------------- */
@@ -915,15 +916,14 @@ export class Runtime {
         if (analysis) {
           const candidates = evaluateStrategies(analysis)
           const selected = candidates.find((c) => c.eligible && c.side === trade.plan.side)
-          const features = [
-            analysis.compositeScore / 100,
-            analysis.mtfAlignment / 100,
-            analysis.indicators.trend.adx / 50,
-            analysis.indicators.momentum.rsi / 100,
-            analysis.indicators.volatility.atrPct / 10,
-            analysis.indicators.volume.volumeRatio / 3,
-            (selected?.score ?? 0) / 100,
-          ]
+          const features = buildFeatureVector({
+            compositeScore: analysis.compositeScore,
+            mtfAlignment: analysis.mtfAlignment,
+            indicators: analysis.indicators,
+            playbookScore: selected?.score ?? 0,
+            marketContext: analysis.marketContext,
+            derivatives: analysis.derivatives,
+          })
           const trainingModelId = this.champion.current.modelId ?? 'baseline'
           this.champion.recordTrainingRow({
             modelId: trainingModelId,
@@ -1027,6 +1027,8 @@ export class Runtime {
         const { manifestHash } = await import('./research/validation.js')
         const { writeFileSync, mkdirSync } = await import('node:fs')
         const { join, resolve } = await import('node:path')
+        const { generateModelName } = await import('./research/naming.js')
+        const { FEATURE_ORDER } = await import('./research/features.js')
         const labelled = baseline.map((r) => ({ at: r.observed_at, symbol: r.inst_id, features: r.features, label: r.label as 0 | 1 }))
         const model = trainCalibratedLinear(labelled)
         if (model) {
@@ -1034,13 +1036,16 @@ export class Runtime {
           const root = resolve(process.env.RESEARCH_ARTIFACTS_PATH ?? join(process.cwd(), 'data/research-artifacts'), artifactHash)
           mkdirSync(root, { recursive: true })
           const artifactPath = join(root, 'model.json')
-          writeFileSync(artifactPath, JSON.stringify({ model, featureOrder: ['composite', 'mtf', 'adx', 'rsi', 'atrPct', 'volumeRatio', 'playbookScore'] }, null, 2))
+          writeFileSync(artifactPath, JSON.stringify({ model, featureOrder: FEATURE_ORDER }, null, 2))
           const modelId = `model:${artifactHash.slice(0, 16)}`
+          const name = generateModelName()
           this.store.registerModel({
             id: modelId, state: 'paper_champion', strategy: 'baseline-trained',
             version: artifactHash.slice(0, 12),
             metrics: { validationBrier: model.validationBrier, trainedRows: model.trainedRows, validationRows: model.validationRows, source: 'baseline' },
             artifactPath,
+            displayName: name,
+            generation: 1,
           })
           // Merge baseline rows into the new champion
           for (const row of baseline) {

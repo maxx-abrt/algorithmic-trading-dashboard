@@ -25,6 +25,8 @@ export interface ModelRegistryRow {
   live_win_rate: number | null
   live_trades_count: number | null
   live_max_drawdown_r: number | null
+  display_name: string | null
+  generation: number
 }
 
 export interface TrainingRow {
@@ -178,6 +180,8 @@ export class DurableStore {
     addColumn('live_win_rate', 'REAL')
     addColumn('live_trades_count', 'INTEGER')
     addColumn('live_max_drawdown_r', 'REAL')
+    addColumn('display_name', 'TEXT')
+    addColumn('generation', 'INTEGER DEFAULT 1')
     this.db.prepare('DELETE FROM paper_events WHERE trade_id LIKE ?').run('campaign:%')
     this.db.prepare('DELETE FROM paper_trades WHERE id LIKE ?').run('campaign:%')
     this.db.prepare('INSERT INTO metadata(key, value, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
@@ -352,10 +356,10 @@ export class DurableStore {
     )
   }
 
-  registerModel(model: { id: string; state: string; strategy: string; version: string; metrics: unknown; artifactPath?: string; rollbackReason?: string; settingsJson?: string; weightsJson?: string; parentId?: string }) {
-    this.db.prepare(`INSERT OR REPLACE INTO model_registry(id,created_at,state,strategy,version,metrics_json,artifact_path,rollback_reason,settings_json,weights_json,parent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+  registerModel(model: { id: string; state: string; strategy: string; version: string; metrics: unknown; artifactPath?: string; rollbackReason?: string; settingsJson?: string; weightsJson?: string; parentId?: string; displayName?: string; generation?: number }) {
+    this.db.prepare(`INSERT OR REPLACE INTO model_registry(id,created_at,state,strategy,version,metrics_json,artifact_path,rollback_reason,settings_json,weights_json,parent_id,display_name,generation) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       model.id, Date.now(), model.state, model.strategy, model.version, JSON.stringify(model.metrics), model.artifactPath ?? null, model.rollbackReason ?? null,
-      model.settingsJson ?? null, model.weightsJson ?? null, model.parentId ?? null,
+      model.settingsJson ?? null, model.weightsJson ?? null, model.parentId ?? null, model.displayName ?? null, model.generation ?? 1,
     )
   }
 
@@ -363,6 +367,10 @@ export class DurableStore {
     this.db.prepare(`UPDATE model_registry SET state='paper_champion', promoted_at=?, settings_json=?, weights_json=? WHERE id=?`).run(
       Date.now(), settingsJson ?? null, weightsJson ?? null, id,
     )
+  }
+
+  setCanaryState(id: string) {
+    this.db.prepare(`UPDATE model_registry SET state='paper_canary', promoted_at=? WHERE id=?`).run(Date.now(), id)
   }
 
   retireModel(id: string, reason: string, state = 'rolled_back') {
@@ -373,6 +381,32 @@ export class DurableStore {
 
   setCanaryStatus(id: string, status: string) {
     this.db.prepare(`UPDATE model_registry SET canary_status=? WHERE id=?`).run(status, id)
+  }
+
+  listAllModels(limit = 100): ModelRegistryRow[] {
+    return (this.db.prepare('SELECT * FROM model_registry ORDER BY created_at DESC LIMIT ?').all(limit) as Record<string, unknown>[])
+      .map((row) => ({
+        id: String(row.id),
+        created_at: Number(row.created_at),
+        state: String(row.state),
+        strategy: String(row.strategy),
+        version: String(row.version),
+        metrics_json: JSON.parse(String(row.metrics_json ?? '{}')),
+        artifact_path: row.artifact_path ? String(row.artifact_path) : null,
+        rollback_reason: row.rollback_reason ? String(row.rollback_reason) : null,
+        settings_json: row.settings_json ? String(row.settings_json) : null,
+        weights_json: row.weights_json ? String(row.weights_json) : null,
+        promoted_at: row.promoted_at != null ? Number(row.promoted_at) : null,
+        retired_at: row.retired_at != null ? Number(row.retired_at) : null,
+        parent_id: row.parent_id ? String(row.parent_id) : null,
+        canary_status: row.canary_status ? String(row.canary_status) : null,
+        live_mean_r: row.live_mean_r != null ? Number(row.live_mean_r) : null,
+        live_win_rate: row.live_win_rate != null ? Number(row.live_win_rate) : null,
+        live_trades_count: row.live_trades_count != null ? Number(row.live_trades_count) : null,
+        live_max_drawdown_r: row.live_max_drawdown_r != null ? Number(row.live_max_drawdown_r) : null,
+        display_name: row.display_name ? String(row.display_name) : null,
+        generation: row.generation != null ? Number(row.generation) : 1,
+      }))
   }
 
   updateLiveStats(id: string, meanR: number, winRate: number, tradesCount: number, maxDrawdownR: number) {
@@ -403,6 +437,8 @@ export class DurableStore {
       live_win_rate: row.live_win_rate != null ? Number(row.live_win_rate) : null,
       live_trades_count: row.live_trades_count != null ? Number(row.live_trades_count) : null,
       live_max_drawdown_r: row.live_max_drawdown_r != null ? Number(row.live_max_drawdown_r) : null,
+      display_name: row.display_name ? String(row.display_name) : null,
+      generation: row.generation != null ? Number(row.generation) : 1,
     }
   }
 
@@ -427,6 +463,8 @@ export class DurableStore {
         live_win_rate: row.live_win_rate != null ? Number(row.live_win_rate) : null,
         live_trades_count: row.live_trades_count != null ? Number(row.live_trades_count) : null,
         live_max_drawdown_r: row.live_max_drawdown_r != null ? Number(row.live_max_drawdown_r) : null,
+        display_name: row.display_name ? String(row.display_name) : null,
+        generation: row.generation != null ? Number(row.generation) : 1,
       }))
   }
 

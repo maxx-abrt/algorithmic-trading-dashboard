@@ -14,6 +14,7 @@ import { manifestHash, purgedWalkForward, validationMetrics } from './validation
 import { trainCalibratedLinear, type LabelledFeatureRow } from './calibration.js'
 import type { ChampionService } from './champion.js'
 import { getCachedMarketContext } from '../quant/market-context.js'
+import { generateModelName } from './naming.js'
 
 export interface CampaignRequest {
   symbols?: string[]
@@ -202,13 +203,14 @@ export class ResearchLab {
         metrics: { combined, trials, promotionReasons, calibration: calibratedModel ? { validationBrier: calibratedModel.validationBrier, trainedRows: calibratedModel.trainedRows, validationRows: calibratedModel.validationRows } : null },
         artifactPath,
         rollbackReason: promotionReasons.join(',') || undefined,
+        displayName: generateModelName(),
+        generation: 1,
       })
       // Champion promotion hook: evaluate the candidate and start canary if appropriate
       if (validationState === 'SHADOW_CANDIDATE' && (request.autoPromote ?? true) && this.champion) {
         const modelId = `model:${result.manifestHash.slice(0, 16)}`
         const evaluation = this.champion.evaluateCandidate(result)
         if (evaluation.shouldCanary) {
-          this.store.setCanaryStatus(modelId, 'canary_running')
           this.champion.startCanary(modelId)
           result.promotionReasons = [...result.promotionReasons, `auto_canary_started:${evaluation.reasons.join(',')}`]
         } else {

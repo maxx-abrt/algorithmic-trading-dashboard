@@ -7,12 +7,16 @@ import { loadCalibratedModel, predictCalibrated, trainCalibratedLinear } from '.
 import type { CampaignResult } from './lab.js'
 import type { ValidationMetrics } from './validation.js'
 import { manifestHash } from './validation.js'
+import { generateModelName } from './naming.js'
+import { FEATURE_ORDER } from './features.js'
 
 export interface ChampionState {
   modelId: string | null
   version: string | null
   artifact: CalibratedLinearModel | null
   artifactPath: string | null
+  displayName: string | null
+  generation: number
 }
 
 export interface CanaryStats {
@@ -28,7 +32,7 @@ const ROLLBACK_WINDOW = 30
 const ROLLBACK_MAX_DRAWDOWN_R = 8
 
 export class ChampionService {
-  private state: ChampionState = { modelId: null, version: null, artifact: null, artifactPath: null }
+  private state: ChampionState = { modelId: null, version: null, artifact: null, artifactPath: null, displayName: null, generation: 0 }
   private previousChampionId: string | null = null
   private canaryModelId: string | null = null
 
@@ -54,7 +58,7 @@ export class ChampionService {
     const research = this.store.researchState()
     const champion = research.champion as Record<string, unknown> | null
     if (!champion) {
-      this.state = { modelId: null, version: null, artifact: null, artifactPath: null }
+      this.state = { modelId: null, version: null, artifact: null, artifactPath: null, displayName: null, generation: 0 }
       return this.state
     }
     const artifactPath = champion.artifact_path ? String(champion.artifact_path) : null
@@ -64,8 +68,10 @@ export class ChampionService {
       version: String(champion.version),
       artifact,
       artifactPath,
+      displayName: champion.display_name ? String(champion.display_name) : null,
+      generation: champion.generation != null ? Number(champion.generation) : 1,
     }
-    log.info('champion', `loaded champion ${this.state.version} (artifact ${artifact ? 'ok' : 'missing'})`)
+    log.info('champion', `loaded champion ${this.state.displayName ?? this.state.version} gen${this.state.generation} (artifact ${artifact ? 'ok' : 'missing'})`)
     return this.state
   }
 
@@ -126,8 +132,8 @@ export class ChampionService {
 
   /** Start a canary stage for a candidate model. */
   startCanary(modelId: string): void {
-    // Promote the model to paper_canary state so it's discoverable
-    this.store.promoteModel(modelId)
+    // Set the model to paper_canary state so it's discoverable by loadCanaryFromStore
+    this.store.setCanaryState(modelId)
     this.store.setCanaryStatus(modelId, 'canary_running')
     this.canaryModelId = modelId
     log.info('champion', `canary started for model ${modelId}`)
@@ -184,6 +190,7 @@ export class ChampionService {
     }
     this.store.promoteModel(canaryModelId, settingsJson, weightsJson)
     this.store.setCanaryStatus(canaryModelId, 'promoted')
+    this.canaryModelId = null
     this.loadFromStore()
     log.info('champion', `promoted canary ${canaryModelId} to paper_champion`)
   }
@@ -214,7 +221,7 @@ export class ChampionService {
         return { ok: true, fallback: `restored_previous_champion_${this.state.version}` }
       }
     }
-    this.state = { modelId: null, version: null, artifact: null, artifactPath: null }
+    this.state = { modelId: null, version: null, artifact: null, artifactPath: null, displayName: null, generation: 0 }
     return { ok: true, fallback: 'heuristic-baseline' }
   }
 
@@ -223,7 +230,7 @@ export class ChampionService {
     this.store.recordTrainingRow(row)
   }
 
-  /** Retrain the champion on all accumulated training rows. */
+  /** Retrain the champion on all accumulated training rows, trying multiple L2 strengths. */
   retrainChampion(): { accepted: boolean; reason: string; newBrier?: number; oldBrier?: number } {
     if (!this.state.modelId) return { accepted: false, reason: 'no_champion' }
     const rows = this.store.listTrainingRows(this.state.modelId)
@@ -236,23 +243,38 @@ export class ChampionService {
       label: r.label as 0 | 1,
     }))
 
-    const newModel = trainCalibratedLinear(labelled)
-    if (!newModel) return { accepted: false, reason: 'training_failed' }
+    // Grid search over L2 regularization strengths
+    const l2Values = [0.01, 0.1, 0.5, 1.0, 5.0]
+    let bestModel: CalibratedLinearModel | null = null
+    let bestBrier = Infinity
+    for (const l2 of l2Values) {
+      const candidate = trainCalibratedLinear(labelled, { l2 })
+      if (candidate && candidate.validationBrier != null && candidate.validationBrier < bestBrier) {
+        bestModel = candidate
+        bestBrier = candidate.validationBrier
+      }
+    }
+    if (!bestModel) return { accepted: false, reason: 'all_training_failed' }
 
     const oldBrier = this.state.artifact?.validationBrier ?? null
-    const newBrier = newModel.validationBrier
+    const newBrier = bestModel.validationBrier
 
-    // Validate: new model must have better or equal Brier and positive bootstrap lower bound
+    // Validate: new model must have better Brier
     if (newBrier != null && oldBrier != null && newBrier >= oldBrier) {
       return { accepted: false, reason: `new_brier_${newBrier.toFixed(4)}_not_better_than_${oldBrier.toFixed(4)}`, newBrier: newBrier ?? undefined, oldBrier: oldBrier ?? undefined }
     }
 
     // Write the new artifact
-    const artifactHash = manifestHash(newModel)
+    const artifactHash = manifestHash(bestModel)
     const root = resolve(process.env.RESEARCH_ARTIFACTS_PATH ?? join(process.cwd(), 'data/research-artifacts'), artifactHash)
     mkdirSync(root, { recursive: true })
     const artifactPath = join(root, 'model.json')
-    writeFileSync(artifactPath, JSON.stringify({ model: newModel, featureOrder: ['composite', 'mtf', 'adx', 'rsi', 'atrPct', 'volumeRatio', 'playbookScore'] }, null, 2))
+    writeFileSync(artifactPath, JSON.stringify({ model: bestModel, featureOrder: FEATURE_ORDER }, null, 2))
+
+    // Save previous champion for potential rollback
+    this.previousChampionId = this.state.modelId
+    const newGen = this.state.generation + 1
+    const newName = generateModelName()
 
     // Update the champion record with the new artifact
     this.store.registerModel({
@@ -260,14 +282,16 @@ export class ChampionService {
       state: 'paper_champion',
       strategy: 'explicit-playbook-registry',
       version: artifactHash.slice(0, 12),
-      metrics: { retrained: true, validationBrier: newBrier, trainedRows: newModel.trainedRows, validationRows: newModel.validationRows, parentId: this.state.modelId },
+      metrics: { retrained: true, validationBrier: newBrier, trainedRows: bestModel.trainedRows, validationRows: bestModel.validationRows, parentId: this.state.modelId, l2GridSearch: true },
       artifactPath,
       parentId: this.state.modelId,
+      displayName: newName,
+      generation: newGen,
     })
     // Retire the old champion
     this.store.retireModel(this.state.modelId, 'superseded_by_retrain', 'retired')
     this.loadFromStore()
-    log.info('champion', `retrained champion: brier ${oldBrier?.toFixed(4) ?? 'n/a'} → ${newBrier?.toFixed(4) ?? 'n/a'}`)
+    log.info('champion', `retrained champion: ${newName} gen${newGen} brier ${oldBrier?.toFixed(4) ?? 'n/a'} → ${newBrier?.toFixed(4) ?? 'n/a'}`)
     return { accepted: true, reason: 'retrained', newBrier: newBrier ?? undefined, oldBrier: oldBrier ?? undefined }
   }
 

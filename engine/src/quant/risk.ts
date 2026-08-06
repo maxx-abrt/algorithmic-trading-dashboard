@@ -11,6 +11,7 @@ import type { EdgeBlock } from './edge'
 import type { SessionInfo } from './sessions'
 import type { CalibratedLinearModel } from '../research/calibration'
 import { predictCalibrated } from '../research/calibration'
+import { buildFeatureVector } from '../research/features'
 import type {
   DerivativesBlock,
   EngineSettings,
@@ -93,6 +94,8 @@ export interface BuildPlanInput {
   compositeScore?: number
   /** mtf alignment from the analysis, used as a champion feature */
   mtfAlignment?: number
+  /** market context for champion feature vector */
+  marketContext?: { fearGreedIndex: number | null; sentimentScore: number | null; btcDominance: number | null; marketCapChange24h: number | null } | null
 }
 
 function fmtUsd(n: number) {
@@ -322,19 +325,18 @@ export function buildRiskPlan(input: BuildPlanInput): RiskPlan {
   const empirical = edge && edge.sample >= 8 ? edge.adjustedWinRate / 100 : null
   let modelProb: number | null = null
   if (input.championModel) {
-    const features = [
-      (input.compositeScore ?? 0) / 100,
-      (input.mtfAlignment ?? 0) / 100,
-      i.trend.adx / 50,
-      i.momentum.rsi / 100,
-      i.volatility.atrPct / 10,
-      i.volume.volumeRatio / 3,
-      (input.playbookScore ?? 0) / 100,
-    ]
+    const features = buildFeatureVector({
+      compositeScore: input.compositeScore ?? 0,
+      mtfAlignment: input.mtfAlignment ?? 0,
+      indicators: i,
+      playbookScore: input.playbookScore ?? 0,
+      marketContext: input.marketContext,
+      derivatives: input.derivatives,
+    })
     try { modelProb = predictCalibrated(input.championModel, features) } catch { modelProb = null }
   }
   const blend = empirical != null ? clamp(edge!.confidence, 0, 0.7) : 0
-  const modelBlend = modelProb != null && input.championModel ? clamp(input.championModel.featureCount / 7, 0, 0.25) : 0
+  const modelBlend = modelProb != null && input.championModel ? clamp(input.championModel.featureCount / 15, 0, 0.3) : 0
   const totalBlend = clamp(blend + modelBlend, 0, 0.85)
   const winProbability = clamp(
     convictionProb * (1 - totalBlend) +

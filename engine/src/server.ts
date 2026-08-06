@@ -337,6 +337,35 @@ const routes: Record<string, Handler> = {
     return result
   },
 
+  'GET /api/research/models': () => {
+    const models = runtime.store.listAllModels(100)
+    return models.map((m) => {
+      const metrics = m.metrics_json as Record<string, unknown>
+      const trainingRows = runtime.store.listTrainingRows(m.id).length
+      return {
+        id: m.id,
+        displayName: m.display_name,
+        generation: m.generation,
+        version: m.version,
+        state: m.state,
+        createdAt: m.created_at,
+        promotedAt: m.promoted_at,
+        retiredAt: m.retired_at,
+        parentId: m.parent_id,
+        rollbackReason: m.rollback_reason,
+        canaryStatus: m.canary_status,
+        validationBrier: metrics.validationBrier ?? null,
+        trainedRows: metrics.trainedRows ?? null,
+        liveMeanR: m.live_mean_r,
+        liveWinRate: m.live_win_rate,
+        liveTrades: m.live_trades_count,
+        liveMaxDrawdownR: m.live_max_drawdown_r,
+        trainingRowsAccumulated: trainingRows,
+        artifactPath: m.artifact_path,
+      }
+    })
+  },
+
   'GET /api/operations': () => ({
     health: runtime.health(),
     qualityEvents: runtime.store.listQualityEvents(100),

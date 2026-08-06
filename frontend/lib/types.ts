@@ -533,6 +533,8 @@ export interface ChampionState {
   version: string | null
   artifact: unknown
   artifactPath: string | null
+  displayName: string | null
+  generation: number
 }
 
 export interface ChampionHealth {
@@ -551,6 +553,28 @@ export interface ChampionResponse {
   health: ChampionHealth
   canaryTrades: number
   trainingRows: number
+}
+
+export interface ModelHistoryEntry {
+  id: string
+  displayName: string | null
+  generation: number
+  version: string
+  state: string
+  createdAt: number
+  promotedAt: number | null
+  retiredAt: number | null
+  parentId: string | null
+  rollbackReason: string | null
+  canaryStatus: string | null
+  validationBrier: number | null
+  trainedRows: number | null
+  liveMeanR: number | null
+  liveWinRate: number | null
+  liveTrades: number | null
+  liveMaxDrawdownR: number | null
+  trainingRowsAccumulated: number
+  artifactPath: string | null
 }
 
 export interface ResearchState {

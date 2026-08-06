@@ -735,6 +735,7 @@ export function analyze(input: AnalyzeInput): Analysis {
     compositeScore: comp,
     mtfAlignment: alignment,
     playbookScore,
+    marketContext: input.marketContext ?? null,
   })
   if (decision !== 'WAIT' && candidatePlan.netExpectancyR <= 0) {
     vetoes.push({ id: 'non_positive_net_expectancy', reason: `Plan expectancy is ${candidatePlan.netExpectancyR.toFixed(2)}R after estimated costs`, severity: 'hard' })

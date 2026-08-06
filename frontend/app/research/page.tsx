@@ -2,15 +2,16 @@
 
 import { useState } from 'react'
 import { post, usePoll } from '@/lib/api'
-import type { ChampionResponse, ResearchState } from '@/lib/types'
+import type { ChampionResponse, ModelHistoryEntry, ResearchState } from '@/lib/types'
 import { Badge, Button, EmptyState, NumberInput, Panel, Row, Select } from '@/components/ui/kit'
 import { ago, fmtR, titleCase } from '@/lib/format'
-import { Beaker, Loader2, Play, ShieldAlert, TrendingUp, RotateCcw, Sparkles } from 'lucide-react'
+import { Beaker, Loader2, Play, ShieldAlert, TrendingUp, RotateCcw, Sparkles, History } from 'lucide-react'
 import { toast } from 'sonner'
 
 export default function ResearchPage() {
   const research = usePoll<ResearchState>('/research', 8000)
   const champion = usePoll<ChampionResponse>('/research/champion', 8000)
+  const models = usePoll<ModelHistoryEntry[]>('/research/models', 15000)
   const [timeframe, setTimeframe] = useState<'5m' | '15m' | '1H'>('15m')
   const [evaluations, setEvaluations] = useState(40)
   const [hypothesis, setHypothesis] = useState('Explicit playbooks retain positive net R across purged chronological folds and a held-out symbol.')
@@ -67,7 +68,7 @@ export default function ResearchPage() {
   return (
     <div className="space-y-3">
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-        <Panel className="xl:col-span-4" title="Bounded campaign" subtitle={champ?.championModel?.modelId ? `champion ${champ.championModel.version} live` : 'no champion — heuristic baseline active'}>
+        <Panel className="xl:col-span-4" title="Bounded campaign" subtitle={champ?.championModel?.modelId ? `${champ.championModel.displayName ?? champ.championModel.version} gen${champ.championModel.generation} live` : 'no champion — heuristic baseline active'}>
           <div className="space-y-3">
             <label className="block"><span className="mb-1 block text-[11px] text-muted-foreground">Hypothesis</span><textarea value={hypothesis} onChange={(event) => setHypothesis(event.target.value)} className="min-h-24 w-full rounded-md border border-border bg-background p-2 text-xs focus:border-ring focus:outline-none" data-testid="research-hypothesis-input" /></label>
             <div className="grid grid-cols-2 gap-3"><label><span className="mb-1 block text-[11px] text-muted-foreground">Timeframe</span><Select value={timeframe} onChange={(event) => setTimeframe(event.target.value as typeof timeframe)} data-testid="research-timeframe-select"><option>5m</option><option>15m</option><option>1H</option></Select></label><label><span className="mb-1 block text-[11px] text-muted-foreground">Max evaluations / symbol</span><NumberInput min={12} max={80} value={evaluations} onChangeValue={setEvaluations} data-testid="research-evaluations-input" /></label></div>
@@ -89,7 +90,8 @@ export default function ResearchPage() {
         <Panel className="xl:col-span-4" title="Champion lifecycle" data-testid="champion-lifecycle-panel">
           <div className="flex items-center gap-2">
             <TrendingUp className="h-4 w-4 text-primary" />
-            <Badge tone={champ?.championModel?.modelId ? 'bull' : 'warning'}>{champ?.championModel?.version ?? 'heuristic-baseline'}</Badge>
+            <Badge tone={champ?.championModel?.modelId ? 'bull' : 'warning'}>{champ?.championModel?.displayName ?? champ?.championModel?.version ?? 'heuristic-baseline'}</Badge>
+            {champ?.championModel?.modelId && <span className="text-[10px] text-muted-foreground">gen{champ.championModel.generation}</span>}
           </div>
           {champ?.championModel?.modelId ? (
             <>
@@ -130,6 +132,62 @@ export default function ResearchPage() {
           <div className="flex items-center gap-2"><ShieldAlert className="h-4 w-4 text-warning" /><Badge tone={data?.validationState === 'VALIDATED' ? 'bull' : 'warning'}>{data?.validationState ?? 'NO_VALIDATED_MODEL'}</Badge></div>
           <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">A model enters shadow state after sample, bootstrap, deflated Sharpe, drawdown and held-out gates pass. Shadow candidates are auto-evaluated for canary promotion against the current champion.</p>
           <div className="mt-3 space-y-2">{data?.models.slice(0, 5).map((model) => <div key={model.id} className="rounded border border-border p-2"><div className="flex justify-between"><span className="num text-[10px]">{model.version}</span><div className="flex items-center gap-1"><Badge tone={model.state === 'shadow_candidate' ? 'info' : model.state === 'paper_champion' ? 'bull' : model.state === 'paper_canary' ? 'warning' : 'neutral'}>{titleCase(model.state)}</Badge>{model.state === 'shadow_candidate' && <Button variant="ghost" className="h-5 px-2 text-[10px]" onClick={() => promote(model.id)} disabled={promoting} data-testid={`promote-${model.id}`}>Promote</Button>}</div></div>{model.rollback_reason && <p className="mt-1 text-[10px] text-muted-foreground">{model.rollback_reason}</p>}</div>)}</div>
+        </Panel>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
+        <Panel className="xl:col-span-12" title="Model lineage" subtitle={`${models.data?.length ?? 0} models trained · names, generations, live stats`} bodyClassName="p-0" data-testid="model-history-panel">
+          {!models.data?.length ? (
+            <EmptyState icon={<History className="h-6 w-6" />} title="No models yet">Models will appear here as the system trains and evolves champions over time.</EmptyState>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-190 border-collapse" data-testid="model-history-table">
+                <thead>
+                  <tr className="border-b border-border text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <th className="px-3 py-2 text-left">Name</th>
+                    <th className="px-3 py-2 text-left">Gen</th>
+                    <th className="px-3 py-2 text-left">State</th>
+                    <th className="px-3 py-2 text-right">Brier</th>
+                    <th className="px-3 py-2 text-right">Train rows</th>
+                    <th className="px-3 py-2 text-right">Live mean R</th>
+                    <th className="px-3 py-2 text-right">Live win%</th>
+                    <th className="px-3 py-2 text-right">Live trades</th>
+                    <th className="px-3 py-2 text-right">Max DD</th>
+                    <th className="px-3 py-2 text-left">Created</th>
+                    <th className="px-3 py-2 text-left">Parent</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {models.data.map((m) => (
+                    <tr key={m.id} className="border-b border-border/50">
+                      <td className="px-3 py-2 text-[11px] font-medium">{m.displayName ?? m.version}</td>
+                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">gen{m.generation}</td>
+                      <td className="px-3 py-2">
+                        <Badge tone={m.state === 'paper_champion' ? 'bull' : m.state === 'paper_canary' ? 'warning' : m.state === 'shadow_candidate' ? 'info' : m.state === 'retired' ? 'neutral' : 'bear'}>
+                          {titleCase(m.state)}
+                        </Badge>
+                      </td>
+                      <td className="num px-3 py-2 text-right text-[10px]">{m.validationBrier != null ? m.validationBrier.toFixed(4) : '—'}</td>
+                      <td className="num px-3 py-2 text-right text-[10px]">{m.trainingRowsAccumulated}</td>
+                      <td className="num px-3 py-2 text-right text-[10px]" style={{ color: m.liveMeanR != null && m.liveMeanR > 0 ? 'var(--bull)' : m.liveMeanR != null ? 'var(--bear)' : undefined }}>{m.liveMeanR != null ? fmtR(m.liveMeanR) : '—'}</td>
+                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveWinRate != null ? `${(m.liveWinRate * 100).toFixed(0)}%` : '—'}</td>
+                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveTrades ?? '—'}</td>
+                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveMaxDrawdownR != null ? fmtR(-m.liveMaxDrawdownR) : '—'}</td>
+                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">{ago(m.createdAt)}</td>
+                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">{m.parentId ? m.parentId.slice(0, 12) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {models.data?.some((m) => m.rollbackReason) && (
+            <div className="border-t border-border p-2 text-[10px] text-muted-foreground">
+              {models.data.filter((m) => m.rollbackReason).slice(0, 3).map((m) => (
+                <div key={m.id}>{m.displayName ?? m.version}: {m.rollbackReason}</div>
+              ))}
+            </div>
+          )}
         </Panel>
       </div>
     </div>
