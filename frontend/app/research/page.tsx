@@ -2,194 +2,168 @@
 
 import { useState } from 'react'
 import { post, usePoll } from '@/lib/api'
-import type { ChampionResponse, ModelHistoryEntry, ResearchState } from '@/lib/types'
-import { Badge, Button, EmptyState, NumberInput, Panel, Row, Select } from '@/components/ui/kit'
-import { ago, fmtR, titleCase } from '@/lib/format'
-import { Beaker, Loader2, Play, ShieldAlert, TrendingUp, RotateCcw, Sparkles, History } from 'lucide-react'
+import type { ResearchState } from '@/lib/types'
+import type { HarvestState } from '@/lib/evolution'
+import { fmtR, niceNiche } from '@/lib/evolution'
+import { Badge, Button, EmptyState, ErrorNote, Gauge, Panel, Row, Select, Skeleton } from '@/components/ui/kit'
+import { ago } from '@/lib/format'
+import { cn } from '@/lib/utils'
+import { FlaskConical, Sprout } from 'lucide-react'
 import { toast } from 'sonner'
 
+const CAMPAIGN_TYPES = [
+  'baseline',
+  'spot_swap',
+  'multi_symbol',
+  'timeframe_sweep',
+  'ensemble',
+  'triple_barrier',
+  'feature_rich',
+  'high_conviction',
+  'low_conviction',
+  'regime_aware',
+]
+
 export default function ResearchPage() {
-  const research = usePoll<ResearchState>('/research', 8000)
-  const champion = usePoll<ChampionResponse>('/research/champion', 8000)
-  const models = usePoll<ModelHistoryEntry[]>('/research/models', 15000)
-  const [timeframe, setTimeframe] = useState<'5m' | '15m' | '1H'>('15m')
-  const [evaluations, setEvaluations] = useState(40)
-  const [hypothesis, setHypothesis] = useState('Explicit playbooks retain positive net R across purged chronological folds and a held-out symbol.')
-  const [running, setRunning] = useState(false)
-  const [promoting, setPromoting] = useState(false)
-  const [rollingBack, setRollingBack] = useState(false)
-  const [retraining, setRetraining] = useState(false)
+  const research = usePoll<ResearchState>('/research', 10000)
+  const harvest = usePoll<HarvestState>('/harvest', 5000)
+  const [type, setType] = useState('baseline')
+  const [busy, setBusy] = useState(false)
 
-  const run = async () => {
-    setRunning(true)
+  const call = async (path: string, payload: unknown, label: string) => {
+    setBusy(true)
     try {
-      const result = await post<{ validationState: string; promotionReasons: string[] }>('/research/run', {
-        timeframe, maxEvaluations: evaluations, hypothesis, symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP'],
-      })
-      toast.success(`${result.validationState}: ${result.promotionReasons.length ? result.promotionReasons.join(', ') : 'passed shadow gates'}`)
-      await Promise.all([research.refresh(), champion.refresh()])
-    } catch (error) { toast.error(error instanceof Error ? error.message : 'Research campaign failed') }
-    finally { setRunning(false) }
+      await post(path, payload)
+      toast.success(label)
+      await Promise.all([research.refresh(), harvest.refresh()])
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
-  const promote = async (modelId: string) => {
-    setPromoting(true)
-    try {
-      await post('/research/promote', { modelId })
-      toast.success(`Promoted ${modelId} to paper champion`)
-      await Promise.all([research.refresh(), champion.refresh()])
-    } catch (error) { toast.error(error instanceof Error ? error.message : 'Promotion failed') }
-    finally { setPromoting(false) }
-  }
+  const progress = harvest.data?.progress
 
-  const rollback = async () => {
-    setRollingBack(true)
-    try {
-      const result = await post<{ ok: boolean; fallback: string }>('/research/rollback', { reason: 'manual_rollback' })
-      toast.success(`Rolled back: ${result.fallback}`)
-      await Promise.all([research.refresh(), champion.refresh()])
-    } catch (error) { toast.error(error instanceof Error ? error.message : 'Rollback failed') }
-    finally { setRollingBack(false) }
-  }
-
-  const retrain = async () => {
-    setRetraining(true)
-    try {
-      const result = await post<{ accepted: boolean; reason: string }>('/research/retrain')
-      if (result.accepted) toast.success(`Retrained: ${result.reason}`)
-      else toast.error(`Retrain rejected: ${result.reason}`)
-      await champion.refresh()
-    } catch (error) { toast.error(error instanceof Error ? error.message : 'Retrain failed') }
-    finally { setRetraining(false) }
-  }
-
-  const data = research.data
-  const champ = champion.data
   return (
-    <div className="space-y-3">
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-        <Panel className="xl:col-span-4" title="Bounded campaign" subtitle={champ?.championModel?.modelId ? `${champ.championModel.displayName ?? champ.championModel.version} gen${champ.championModel.generation} live` : 'no champion — heuristic baseline active'}>
-          <div className="space-y-3">
-            <label className="block"><span className="mb-1 block text-[11px] text-muted-foreground">Hypothesis</span><textarea value={hypothesis} onChange={(event) => setHypothesis(event.target.value)} className="min-h-24 w-full rounded-md border border-border bg-background p-2 text-xs focus:border-ring focus:outline-none" data-testid="research-hypothesis-input" /></label>
-            <div className="grid grid-cols-2 gap-3"><label><span className="mb-1 block text-[11px] text-muted-foreground">Timeframe</span><Select value={timeframe} onChange={(event) => setTimeframe(event.target.value as typeof timeframe)} data-testid="research-timeframe-select"><option>5m</option><option>15m</option><option>1H</option></Select></label><label><span className="mb-1 block text-[11px] text-muted-foreground">Max evaluations / symbol</span><NumberInput min={12} max={80} value={evaluations} onChangeValue={setEvaluations} data-testid="research-evaluations-input" /></label></div>
-            <div className="rounded border border-border bg-card-2/50 p-2 text-[10px] leading-relaxed text-muted-foreground">Fixed universe: BTC and ETH perpetuals. Confirmed candles only. Purge + embargo: 12 bars. Held-out symbol gate required. Maximum 80 evaluations per symbol. Automatic campaigns: {data?.schedule.enabled ? `every ${data.schedule.intervalHours}h` : 'disabled'}.</div>
-            <Button className="w-full" variant="primary" onClick={run} disabled={running || !data?.governor.allowed} data-testid="run-backtest-button">{running ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}Run real-data campaign</Button>
-            {data?.governor && <div className="grid grid-cols-2 gap-x-4"><Row label="RSS" value={`${data.governor.rssMb.toFixed(0)} MB`} /><Row label="load" value={data.governor.load1.toFixed(2)} /><Row label="governor" value={data.governor.allowed ? 'ready' : data.governor.reasons.join(', ')} tone={data.governor.allowed ? 'bull' : 'warning'} /></div>}
-          </div>
-        </Panel>
+    <div className="mx-auto w-full max-w-[1400px] space-y-3 p-3 pb-24 sm:p-4 md:pb-4" data-testid="research-page">
+      {research.error && <ErrorNote message={research.error} />}
 
-        <Panel className="xl:col-span-8" title="Research registry" subtitle={`${data?.campaigns.length ?? 0} campaigns · ${data?.trials.length ?? 0} trials · immutable manifests`} bodyClassName="p-0">
-          {!data?.campaigns.length ? <EmptyState icon={<Beaker className="h-6 w-6" />} title="No campaign has run yet">The system starts with no validated edge. Run a bounded campaign to collect evidence without changing live decisions.</EmptyState> : <div className="overflow-x-auto"><table className="w-full min-w-[760px] border-collapse" data-testid="research-campaign-table"><thead><tr className="border-b border-border text-[10px] uppercase tracking-wider text-muted-foreground"><th className="px-3 py-2 text-left">Created</th><th className="px-3 py-2 text-left">Campaign</th><th className="px-3 py-2 text-left">Status</th><th className="px-3 py-2 text-left">Hypothesis</th><th className="px-3 py-2 text-right">Trials</th></tr></thead><tbody>{data.campaigns.map((campaign) => { const id = String(campaign.id); return <tr key={id} className="border-b border-border/50"><td className="num px-3 py-2 text-[10px] text-muted-foreground">{ago(Number(campaign.created_at))}</td><td className="num px-3 py-2 text-[10px]">{id.slice(0, 24)}</td><td className="px-3 py-2"><Badge tone={campaign.status === 'completed' ? 'bull' : campaign.status === 'failed' ? 'bear' : 'warning'}>{String(campaign.status)}</Badge></td><td className="max-w-md px-3 py-2 text-[11px]">{String(campaign.hypothesis)}</td><td className="num px-3 py-2 text-right text-xs">{data.trials.filter((trial) => trial.campaign_id === id).length}</td></tr>})}</tbody></table></div>}
-        </Panel>
-      </div>
-
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-        <Panel className="xl:col-span-8" title="Trial evidence" subtitle="null means insufficient evidence, never zero-filled">
-          {!data?.trials.length ? <p className="py-8 text-center text-xs text-muted-foreground">No trial metrics yet.</p> : <div className="grid gap-3 md:grid-cols-2">{data.trials.slice(0, 8).map((trial) => { const m = trial.metrics_json; return <article key={trial.id} className="rounded-lg border border-border bg-card-2/40 p-3"><div className="flex justify-between gap-2"><span className="num text-[10px]">{trial.id.split(':').at(-1)}</span><Badge tone={trial.status === 'completed' ? 'bull' : 'warning'}>{trial.status}</Badge></div><div className="mt-2 grid grid-cols-2 gap-x-5"><Row label="sample" value={String(m.sample ?? 0)} /><Row label="mean R" value={m.meanR == null ? 'insufficient' : fmtR(Number(m.meanR))} /><Row label="win rate" value={m.winRate == null ? 'insufficient' : `${(Number(m.winRate) * 100).toFixed(1)}%`} /><Row label="max DD" value={m.maxDrawdownR == null ? '—' : fmtR(-Number(m.maxDrawdownR))} /><Row label="deflated Sharpe" value={m.deflatedSharpe == null ? 'insufficient' : Number(m.deflatedSharpe).toFixed(2)} /><Row label="folds" value={String(m.folds ?? 0)} /></div></article>})}</div>}
-        </Panel>
-        <Panel className="xl:col-span-4" title="Champion lifecycle" data-testid="champion-lifecycle-panel">
-          <div className="flex items-center gap-2">
-            <TrendingUp className="h-4 w-4 text-primary" />
-            <Badge tone={champ?.championModel?.modelId ? 'bull' : 'warning'}>{champ?.championModel?.displayName ?? champ?.championModel?.version ?? 'heuristic-baseline'}</Badge>
-            {champ?.championModel?.modelId && <span className="text-[10px] text-muted-foreground">gen{champ.championModel.generation}</span>}
-          </div>
-          {champ?.championModel?.modelId ? (
+      <div className="grid gap-3 lg:grid-cols-2">
+        <Panel
+          title="Harvest real history"
+          subtitle="replays confirmed OKX bars through the exact live pipeline to create point-in-time training samples"
+          data-testid="harvest-panel"
+          actions={
+            <Button variant="primary" disabled={busy || progress?.running} onClick={() => void call('/harvest/run', { perType: 6, timeframes: ['15m', '1H'], barsPerSymbol: 900 }, 'Harvest started')} data-testid="harvest-run">
+              <Sprout className="h-3.5 w-3.5" /> {progress?.running ? 'running' : 'start harvest'}
+            </Button>
+          }
+        >
+          {!progress ? (
+            <Skeleton className="h-20" />
+          ) : (
             <>
-              <div className="mt-3 grid grid-cols-2 gap-x-4">
-                <Row label="live mean R" value={champ.health?.meanR != null ? fmtR(champ.health.meanR) : '—'} tone={champ.health?.meanR != null && champ.health.meanR > 0 ? 'bull' : 'bear'} />
-                <Row label="live win rate" value={champ.health?.winRate != null ? `${(champ.health.winRate * 100).toFixed(0)}%` : '—'} />
-                <Row label="live trades" value={String(champ.health?.trades ?? 0)} />
-                <Row label="max DD" value={champ.health?.maxDrawdownR != null ? fmtR(-champ.health.maxDrawdownR) : '—'} />
-                <Row label="training rows" value={String(champ.trainingRows ?? 0)} />
-                <Row label="rollback" value={champ.health?.shouldRollback ? 'triggered' : 'ok'} tone={champ.health?.shouldRollback ? 'bear' : 'bull'} />
-              </div>
-              {champ.health?.reason && <p className="mt-2 text-[10px] text-muted-foreground">{champ.health.reason}</p>}
-              <div className="mt-3 flex gap-2">
-                <Button variant="secondary" className="flex-1" onClick={retrain} disabled={retraining} data-testid="retrain-button">{retraining ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}Retrain</Button>
-                <Button variant="secondary" className="flex-1" onClick={rollback} disabled={rollingBack} data-testid="rollback-button">{rollingBack ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCcw className="h-3.5 w-3.5" />}Rollback</Button>
-              </div>
+              <Row label="lifetime samples harvested" value={progress.totalSamplesEver} />
+              <Row label="last run" value={harvest.data?.last ? `${harvest.data.last.samples} samples` : '—'} hint={harvest.data?.last ? ago(harvest.data.last.at) : undefined} />
+              {progress.running && (
+                <div className="mt-2 space-y-1">
+                  <Gauge value={(progress.seriesDone / Math.max(1, progress.seriesTotal)) * 100} tone="info" />
+                  <p className="truncate text-[10px] text-muted-foreground">
+                    {progress.current} · {progress.seriesDone}/{progress.seriesTotal} series · {progress.samples} new samples
+                  </p>
+                </div>
+              )}
+              {progress.lastError && <p className="mt-1 break-words text-[10px] text-warning">{progress.lastError}</p>}
+              <p className="pt-2 text-[10px] leading-relaxed text-muted-foreground">
+                Every decision only sees bars that closed before its own timestamp, and every sample records when its label became knowable, so overlapping labels can be purged during training.
+              </p>
             </>
-          ) : (
-            <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">No champion model is live. The system uses the heuristic baseline. Run a campaign to produce a shadow candidate, which will enter canary automatically if it passes gates.</p>
-          )}
-          {champ?.canary && (
-            <div className="mt-3 rounded border border-warning/30 bg-warning/10 p-2">
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-medium text-warning">Canary in progress</span>
-                <Badge tone="warning">{String(champ.canary.version ?? '?')}</Badge>
-              </div>
-              <div className="mt-1 grid grid-cols-2 gap-x-4">
-                <Row label="canary trades" value={String(champ.canaryTrades ?? 0)} />
-                <Row label="min for promote" value="20" />
-              </div>
-            </div>
           )}
         </Panel>
-      </div>
 
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-        <Panel className="xl:col-span-12" title="Promotion state" data-testid="advisory-model-state">
-          <div className="flex items-center gap-2"><ShieldAlert className="h-4 w-4 text-warning" /><Badge tone={data?.validationState === 'VALIDATED' ? 'bull' : 'warning'}>{data?.validationState ?? 'NO_VALIDATED_MODEL'}</Badge></div>
-          <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">A model enters shadow state after sample, bootstrap, deflated Sharpe, drawdown and held-out gates pass. Shadow candidates are auto-evaluated for canary promotion against the current champion.</p>
-          <div className="mt-3 space-y-2">{data?.models.slice(0, 5).map((model) => <div key={model.id} className="rounded border border-border p-2"><div className="flex justify-between"><span className="num text-[10px]">{model.version}</span><div className="flex items-center gap-1"><Badge tone={model.state === 'shadow_candidate' ? 'info' : model.state === 'paper_champion' ? 'bull' : model.state === 'paper_canary' ? 'warning' : 'neutral'}>{titleCase(model.state)}</Badge>{model.state === 'shadow_candidate' && <Button variant="ghost" className="h-5 px-2 text-[10px]" onClick={() => promote(model.id)} disabled={promoting} data-testid={`promote-${model.id}`}>Promote</Button>}</div></div>{model.rollback_reason && <p className="mt-1 text-[10px] text-muted-foreground">{model.rollback_reason}</p>}</div>)}</div>
-        </Panel>
-      </div>
-
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-        <Panel className="xl:col-span-12" title="Model lineage" subtitle={`${models.data?.length ?? 0} models trained · names, generations, live stats`} bodyClassName="p-0" data-testid="model-history-panel">
-          {!models.data?.length ? (
-            <EmptyState icon={<History className="h-6 w-6" />} title="No models yet">Models will appear here as the system trains and evolves champions over time.</EmptyState>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-190 border-collapse" data-testid="model-history-table">
-                <thead>
-                  <tr className="border-b border-border text-[10px] uppercase tracking-wider text-muted-foreground">
-                    <th className="px-3 py-2 text-left">Name</th>
-                    <th className="px-3 py-2 text-left">Gen</th>
-                    <th className="px-3 py-2 text-left">State</th>
-                    <th className="px-3 py-2 text-right">Brier</th>
-                    <th className="px-3 py-2 text-right">Train rows</th>
-                    <th className="px-3 py-2 text-right">Live mean R</th>
-                    <th className="px-3 py-2 text-right">Live win%</th>
-                    <th className="px-3 py-2 text-right">Live trades</th>
-                    <th className="px-3 py-2 text-right">Max DD</th>
-                    <th className="px-3 py-2 text-left">Created</th>
-                    <th className="px-3 py-2 text-left">Parent</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {models.data.map((m) => (
-                    <tr key={m.id} className="border-b border-border/50">
-                      <td className="px-3 py-2 text-[11px] font-medium">{m.displayName ?? m.version}</td>
-                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">gen{m.generation}</td>
-                      <td className="px-3 py-2">
-                        <Badge tone={m.state === 'paper_champion' ? 'bull' : m.state === 'paper_canary' ? 'warning' : m.state === 'shadow_candidate' ? 'info' : m.state === 'retired' ? 'neutral' : 'bear'}>
-                          {titleCase(m.state)}
-                        </Badge>
-                      </td>
-                      <td className="num px-3 py-2 text-right text-[10px]">{m.validationBrier != null ? m.validationBrier.toFixed(4) : '—'}</td>
-                      <td className="num px-3 py-2 text-right text-[10px]">{m.trainingRowsAccumulated}</td>
-                      <td className="num px-3 py-2 text-right text-[10px]" style={{ color: m.liveMeanR != null && m.liveMeanR > 0 ? 'var(--bull)' : m.liveMeanR != null ? 'var(--bear)' : undefined }}>{m.liveMeanR != null ? fmtR(m.liveMeanR) : '—'}</td>
-                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveWinRate != null ? `${(m.liveWinRate * 100).toFixed(0)}%` : '—'}</td>
-                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveTrades ?? '—'}</td>
-                      <td className="num px-3 py-2 text-right text-[10px]">{m.liveMaxDrawdownR != null ? fmtR(-m.liveMaxDrawdownR) : '—'}</td>
-                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">{ago(m.createdAt)}</td>
-                      <td className="num px-3 py-2 text-[10px] text-muted-foreground">{m.parentId ? m.parentId.slice(0, 12) : '—'}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {models.data?.some((m) => m.rollbackReason) && (
-            <div className="border-t border-border p-2 text-[10px] text-muted-foreground">
-              {models.data.filter((m) => m.rollbackReason).slice(0, 3).map((m) => (
-                <div key={m.id}>{m.displayName ?? m.version}: {m.rollbackReason}</div>
+        <Panel
+          title="Validation campaign"
+          subtitle="purged walk-forward, held-out symbol, bootstrap bound and deflated Sharpe"
+          data-testid="campaign-panel"
+          actions={
+            <Button variant="secondary" disabled={busy} onClick={() => void call('/research/run', { type }, 'Campaign finished')} data-testid="campaign-run">
+              <FlaskConical className="h-3.5 w-3.5" /> run
+            </Button>
+          }
+        >
+          <label className="flex flex-col gap-1">
+            <span className="text-[11px] font-medium">Campaign type</span>
+            <Select value={type} onChange={(event) => setType(event.target.value)} data-testid="campaign-type">
+              {CAMPAIGN_TYPES.map((value) => (
+                <option key={value} value={value}>
+                  {value.replace(/_/g, ' ')}
+                </option>
               ))}
+            </Select>
+          </label>
+          {research.data && (
+            <div className="pt-2">
+              <Row label="campaigns run" value={research.data.campaigns.length} />
+              <Row label="trials recorded" value={research.data.trials.length} />
+              <Row
+                label="governor"
+                value={<Badge tone={research.data.governor.allowed ? 'bull' : 'warning'}>{research.data.governor.allowed ? 'capacity available' : research.data.governor.reasons.join(', ')}</Badge>}
+                mono={false}
+              />
             </div>
           )}
         </Panel>
       </div>
+
+      {harvest.data?.niches?.length ? (
+        <Panel title="Evidence per niche" subtitle="where the system currently has enough resolved outcomes to learn" bodyClassName="p-0">
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[560px] text-left text-xs">
+              <thead className="border-b border-border text-[10px] uppercase tracking-wide text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2">Niche</th>
+                  <th className="px-2 py-2 text-right">Samples</th>
+                  <th className="px-2 py-2 text-right">Win rate</th>
+                  <th className="px-2 py-2 text-right">Cumulative</th>
+                  <th className="px-3 py-2">Newest sample</th>
+                </tr>
+              </thead>
+              <tbody>
+                {harvest.data.niches.map((niche) => (
+                  <tr key={niche.nicheKey} className="border-b border-border/50">
+                    <td className="px-3 py-2">{niceNiche(niche.nicheKey)}</td>
+                    <td className="num px-2 py-2 text-right">{niche.samples}</td>
+                    <td className="num px-2 py-2 text-right">{niche.samples ? `${((niche.wins / niche.samples) * 100).toFixed(0)}%` : '—'}</td>
+                    <td className={cn('num px-2 py-2 text-right', niche.sumR > 0 ? 'text-bull' : 'text-bear')}>{fmtR(niche.sumR, 1)}</td>
+                    <td className="px-3 py-2 text-[10px] text-muted-foreground">{niche.lastAt ? ago(niche.lastAt) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Panel>
+      ) : null}
+
+      <Panel title="Campaign history" subtitle="a rejection is a valid result and is kept forever" bodyClassName="p-0">
+        {!research.data ? (
+          <Skeleton className="h-24" />
+        ) : !research.data.campaigns.length ? (
+          <EmptyState icon={<FlaskConical className="h-8 w-8" />} title="No campaign has run yet" />
+        ) : (
+          <ul className="divide-y divide-border/50">
+            {research.data.campaigns.slice(0, 20).map((campaign) => (
+              <li key={String(campaign.id)} className="px-3 py-2" data-testid={`campaign-${campaign.id}`}>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={String(campaign.status) === 'completed' ? 'bull' : String(campaign.status) === 'failed' ? 'bear' : 'warning'}>{String(campaign.status)}</Badge>
+                  <span className="text-[11px] text-muted-foreground">{ago(Number(campaign.created_at))}</span>
+                </div>
+                <p className="mt-1 text-[11px] leading-relaxed">{String(campaign.hypothesis ?? '')}</p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </Panel>
     </div>
   )
 }

@@ -94,14 +94,24 @@ export function StatusBar() {
         <Chip
           tone="neutral"
           data-testid="status-local-store"
-          title="SQLite WAL local truth store"
+          title="Labelled point-in-time outcomes in the local SQLite truth store"
         >
           <Dot tone="bull" />
-          sqlite <span className="num">{data?.localStore.paperEvents ?? 0} events</span>
+          sqlite <span className="num">{data?.evolution.samples ?? 0} samples</span>
         </Chip>
 
-        <Chip tone={data?.research.validationState === 'VALIDATED' ? 'bull' : 'warning'} data-testid="status-model-validation">
-          {data?.research.validationState ?? 'NO_VALIDATED_MODEL'}
+        <Chip tone={data?.evolution.validationState === 'VALIDATED' ? 'bull' : 'warning'} data-testid="status-model-validation" title="Champions must pass out-of-sample calibration, the shuffled-label placebo and forward evidence">
+          {data?.evolution.validationState ?? 'NO_VALIDATED_MODEL'}
+          {data?.evolution.champions ? <span className="num text-muted-foreground">{data.evolution.champions}</span> : null}
+        </Chip>
+
+        <Chip
+          tone={data?.demoExecution.configured ? 'neutral' : 'warning'}
+          data-testid="status-demo"
+          title={data?.demoExecution.reason || 'OKX demo execution'}
+        >
+          <Dot tone={data?.demoExecution.configured ? 'bull' : 'warning'} />
+          okx demo <span className="num">{data?.demoExecution.filled ?? 0}/{data?.demoExecution.placed ?? 0}</span>
         </Chip>
 
         <Chip

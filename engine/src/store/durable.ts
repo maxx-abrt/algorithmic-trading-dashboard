@@ -1,10 +1,13 @@
 import Database from 'better-sqlite3'
 import { mkdirSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { dirname } from 'node:path'
 import type { Analysis, Candle } from '../quant/types.js'
 import type { PaperTrade } from '../paper/types.js'
+import { DB_PATH, ensureDirs } from './paths.js'
+import { restoreIfMissing } from './backup.js'
+import { migrateEvolutionSchema } from './evolution-store.js'
 
-export const STORE_SCHEMA_VERSION = 2
+export const STORE_SCHEMA_VERSION = 3
 
 export interface ModelRegistryRow {
   id: string
@@ -61,14 +64,24 @@ export interface CandidateRecord {
 
 export class DurableStore {
   readonly db: Database.Database
+  /** set when a wiped volume was healed from the newest snapshot on boot */
+  readonly restoredFrom: string | null
 
-  constructor(readonly path = process.env.MYCROFT_DB_PATH || resolve(process.cwd(), 'data/mycroft.sqlite')) {
+  constructor(readonly path = DB_PATH) {
     mkdirSync(dirname(path), { recursive: true })
+    let restoredFrom: string | null = null
+    if (path === DB_PATH) {
+      ensureDirs()
+      const restore = restoreIfMissing()
+      if (restore.restored) restoredFrom = restore.from ?? 'snapshot'
+    }
+    this.restoredFrom = restoredFrom
     this.db = new Database(path)
     this.db.pragma('journal_mode = WAL')
     this.db.pragma('synchronous = NORMAL')
     this.db.pragma('foreign_keys = ON')
     this.migrate()
+    migrateEvolutionSchema(this.db)
   }
 
   private migrate() {

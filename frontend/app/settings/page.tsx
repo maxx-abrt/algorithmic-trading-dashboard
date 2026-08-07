@@ -1,431 +1,445 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { api, post, usePoll } from '@/lib/api'
-import type { EngineSettings, Health } from '@/lib/types'
-import { Badge, Button, NumberInput, Panel, Row, Select, Slider, Switch, Tab, TabList, TabPanel, Tabs } from '@/components/ui/kit'
-import { ago, fmtUsd, titleCase } from '@/lib/format'
+import { useEffect, useRef, useState } from 'react'
+import { api, post } from '@/lib/api'
+import type { EngineSettings } from '@/lib/types'
+import { Badge, Button, ErrorNote, NumberInput, Panel, Select, Skeleton, Switch, Tab, TabList, TabPanel, Tabs } from '@/components/ui/kit'
+import { ago } from '@/lib/format'
+import { Check, CircleAlert, Loader2, Save } from 'lucide-react'
 import { toast } from 'sonner'
-import { Loader2, Save, Send } from 'lucide-react'
 
 const BARS = ['1m', '3m', '5m', '15m', '30m', '1H', '2H', '4H', '6H', '12H', '1D']
-const WEIGHTS = ['trend', 'momentum', 'volatility', 'volume', 'structure', 'pattern', 'derivatives', 'mtf', 'stats', 'edge']
+const STRATEGIES = ['adaptive', 'trend', 'meanReversion', 'breakout', 'scalp', 'swing']
+const INST_TYPES = ['SWAP', 'SPOT', 'FUTURES']
 
-export default function SettingsPage() {
-  const health = usePoll<Health>('/health', 6000)
-  const [s, setS] = useState<EngineSettings | null>(null)
-  const [models, setModels] = useState<{ name: string; inputTokenLimit: number; outputTokenLimit: number }[]>([])
-  const [tab, setTab] = useState('engine')
-  const [busy, setBusy] = useState(false)
+type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
-  useEffect(() => {
-    void api<EngineSettings>('/settings').then(setS).catch(() => setS(null))
-    void api<{ models: typeof models }>('/ai/models')
-      .then((r) => setModels(r.models ?? []))
-      .catch(() => setModels([]))
-  }, [])
-
-  const save = async (patch: Partial<EngineSettings>) => {
-    setBusy(true)
-    try {
-      const next = await post<EngineSettings>('/settings', patch)
-      setS(next)
-      toast.success('Engine reconfigured')
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const testTelegram = async () => {
-    try {
-      const res = await post<{ delivered: number }>('/telegram/test')
-      toast.success(`Status card delivered to ${res.delivered} chat(s)`)
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : 'Failed')
-    }
-  }
-
-  if (!s) {
-    return (
-      <Panel title="Settings">
-        <div className="skeleton h-64 rounded" />
-      </Panel>
-    )
-  }
-
-  const set = (patch: Partial<EngineSettings>) => setS({ ...s, ...patch })
-
+/** A labelled control row: dense, mobile-first, and it always explains itself. */
+function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-12">
-      <Panel
-        className="xl:col-span-8"
-        title="Engine configuration"
-        subtitle="changes are persisted locally in SQLite and applied by the running engine immediately"
-        actions={
-          <Button size="sm" variant="primary" onClick={() => void save(s)} disabled={busy} data-testid="settings-save-button">
-            {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-            Save all
-          </Button>
-        }
-        bodyClassName="p-0"
-      >
-        <Tabs value={tab} onChange={setTab}>
-          <TabList>
-            <Tab id="engine">Decision</Tab>
-            <Tab id="risk">Risk</Tab>
-            <Tab id="weights">Weights</Tab>
-            <Tab id="ai">AI</Tab>
-            <Tab id="scanner">Scanner</Tab>
-            <Tab id="telegram">Telegram</Tab>
-          </TabList>
-
-          <div className="p-3">
-            <TabPanel id="engine">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="focus instrument">
-                  <input
-                    className="num h-8 w-full rounded-md border border-border bg-background px-2.5 text-sm"
-                    value={s.instId}
-                    onChange={(e) => set({ instId: e.target.value.toUpperCase() })}
-                  />
-                </Field>
-                <Field label="entry timeframe">
-                  <Select value={s.timeframe} onChange={(e) => set({ timeframe: e.target.value })}>
-                    {BARS.map((b) => (
-                      <option key={b}>{b}</option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="context timeframe (HTF)">
-                  <Select value={s.htfTimeframe} onChange={(e) => set({ htfTimeframe: e.target.value })}>
-                    <option value="auto">auto (ladder)</option>
-                    {BARS.map((b) => (
-                      <option key={b}>{b}</option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="macro timeframe (HTF2)">
-                  <Select value={s.htf2Timeframe} onChange={(e) => set({ htf2Timeframe: e.target.value })}>
-                    <option value="auto">auto (ladder)</option>
-                    {BARS.map((b) => (
-                      <option key={b}>{b}</option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="strategy bias">
-                  <Select value={s.strategy} onChange={(e) => set({ strategy: e.target.value })}>
-                    {['adaptive', 'trend_momentum', 'mean_reversion', 'breakout', 'pattern_confirm'].map((v) => (
-                      <option key={v} value={v}>
-                        {titleCase(v)}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label={`min conviction to act · ${s.minConfidence}`} hint="lower = more signals, more noise">
-                  <Slider value={s.minConfidence} min={30} max={90} onChange={(v) => set({ minConfidence: v })} />
-                </Field>
-                <Field label={`min |composite| · ${s.minCompositeScore}`}>
-                  <Slider value={s.minCompositeScore} min={5} max={60} onChange={(v) => set({ minCompositeScore: v })} />
-                </Field>
-                <Field label={`ADX floor · ${s.minAdx}`}>
-                  <Slider value={s.minAdx} min={0} max={35} onChange={(v) => set({ minAdx: v })} />
-                </Field>
-                <Field label={`max ATR% · ${s.maxAtrPct}`} hint="volatility ceiling before standing aside">
-                  <Slider value={s.maxAtrPct} min={1} max={25} step={0.5} onChange={(v) => set({ maxAtrPct: v })} />
-                </Field>
-                <div className="space-y-2">
-                  <Switch
-                    checked={s.requireMtfAlignment}
-                    onChange={(v) => set({ requireMtfAlignment: v })}
-                    label="require multi-timeframe alignment for trend playbooks"
-                  />
-                  <Switch checked={s.usePatterns} onChange={(v) => set({ usePatterns: v })} label="candlestick confirmation layer" />
-                  <Switch checked={s.useDerivatives} onChange={(v) => set({ useDerivatives: v })} label="derivatives context (funding, OI, book)" />
-                  <Switch
-                    checked={s.useEmpiricalEdge}
-                    onChange={(v) => set({ useEmpiricalEdge: v })}
-                    label="empirical edge back-scan"
-                  />
-                  <Switch checked={s.engineEnabled} onChange={(v) => set({ engineEnabled: v })} label="engine running" />
-                  <Switch checked={s.autoResearchEnabled} onChange={(v) => set({ autoResearchEnabled: v })} label="scheduled local research campaigns" />
-                </div>
-              </div>
-            </TabPanel>
-
-            <TabPanel id="risk">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label={`risk per trade · ${s.riskPerTradePct}% of equity`}>
-                  <Slider value={s.riskPerTradePct} min={0.1} max={5} step={0.1} onChange={(v) => set({ riskPerTradePct: v })} />
-                </Field>
-                <Field label={`max leverage · ${s.leverage}×`} hint="the engine lowers it when volatility demands">
-                  <Slider value={s.leverage} min={1} max={50} onChange={(v) => set({ leverage: v })} />
-                </Field>
-                <Field label={`minimum R:R · ${s.rrRatio}`}>
-                  <Slider value={s.rrRatio} min={1} max={6} step={0.1} onChange={(v) => set({ rrRatio: v })} />
-                </Field>
-                <Field label="sizing equity (USD)" hint="used when no OKX balance is available">
-                  <NumberInput value={s.equityUsd} onChangeValue={(v) => set({ equityUsd: v })} />
-                </Field>
-                <Field label="taker fee (bps)" hint="OKX perp taker is 5bps by default">
-                  <NumberInput value={s.takerFeeBps} onChangeValue={(v) => set({ takerFeeBps: v })} />
-                </Field>
-                <Field label="maximum open paper positions">
-                  <NumberInput value={s.maxOpenPositions} min={1} max={10} onChangeValue={(v) => set({ maxOpenPositions: v })} />
-                </Field>
-                <Field label="daily paper loss kill (R)">
-                  <NumberInput value={s.maxDailyLossPct} min={0.5} max={20} step={0.5} onChangeValue={(v) => set({ maxDailyLossPct: v })} />
-                </Field>
-                <Field label="maximum open risk (% equity)">
-                  <NumberInput value={s.maxOpenRiskPct} min={0.5} max={20} step={0.5} onChangeValue={(v) => set({ maxOpenRiskPct: v })} />
-                </Field>
-                <Field label="maximum gross paper exposure (%)">
-                  <NumberInput value={s.maxGrossExposurePct} min={10} max={500} step={10} onChangeValue={(v) => set({ maxGrossExposurePct: v })} />
-                </Field>
-                <Field label="read-only OKX balance" hint={health.data?.okxKeys ? 'API keys detected' : 'not required for paper research'}>
-                  <Switch
-                    checked={s.useAccountBalance}
-                    onChange={(v) => set({ useAccountBalance: v })}
-                    label="size from the real account balance"
-                    disabled={!health.data?.okxKeys}
-                  />
-                </Field>
-              </div>
-              <p className="mt-3 rounded border border-border bg-card-2/50 p-2 text-[11px] leading-relaxed text-muted-foreground">
-                The engine has no order endpoint at all: sizing, leverage and targets are advisory numbers for manual
-                execution on OKX. Read-only keys only unlock balance-aware position sizing.
-              </p>
-            </TabPanel>
-
-            <TabPanel id="weights">
-              <p className="mb-3 text-[11px] text-muted-foreground">
-                Multipliers applied on top of the regime-adaptive base weights. 1.0 keeps the tuned default.
-              </p>
-              <div className="grid gap-3 sm:grid-cols-2">
-                {WEIGHTS.map((k) => (
-                  <Field key={k} label={`${titleCase(k)} · ${(s.weights[k] ?? 1).toFixed(2)}×`}>
-                    <Slider
-                      value={s.weights[k] ?? 1}
-                      min={0}
-                      max={2.5}
-                      step={0.05}
-                      onChange={(v) => set({ weights: { ...s.weights, [k]: v } })}
-                    />
-                  </Field>
-                ))}
-              </div>
-            </TabPanel>
-
-            <TabPanel id="ai">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="model" hint={`${models.length} models available on your key`}>
-                  <Select value={s.ai.model} onChange={(e) => set({ ai: { ...s.ai, model: e.target.value } })} data-testid="settings-ai-model">
-                    {models.length === 0 && <option value={s.ai.model}>{s.ai.model}</option>}
-                    {models.map((m) => (
-                      <option key={m.name} value={m.name}>
-                        {m.name}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="context depth" hint="how much of the brief the model receives">
-                  <Select value={s.ai.contextDepth} onChange={(e) => set({ ai: { ...s.ai, contextDepth: e.target.value } })}>
-                    <option value="compact">compact (~300 tokens)</option>
-                    <option value="standard">standard (~2.5k tokens)</option>
-                    <option value="deep">deep (full evidence, ~5k tokens)</option>
-                  </Select>
-                </Field>
-                <Field label={`temperature · ${s.ai.temperature.toFixed(2)}`}>
-                  <Slider value={s.ai.temperature} min={0} max={1} step={0.05} onChange={(v) => set({ ai: { ...s.ai, temperature: v } })} />
-                </Field>
-                <Field label="max output tokens">
-                  <NumberInput value={s.ai.maxOutputTokens} onChangeValue={(v) => set({ ai: { ...s.ai, maxOutputTokens: v } })} />
-                </Field>
-                <Field label="thinking budget" hint="0 disables reasoning tokens (cheapest)">
-                  <NumberInput value={s.ai.thinkingBudget} onChangeValue={(v) => set({ ai: { ...s.ai, thinkingBudget: v } })} />
-                </Field>
-                <Field label={`ask only above conviction · ${s.ai.minConvictionToAsk}`}>
-                  <Slider value={s.ai.minConvictionToAsk} min={0} max={90} onChange={(v) => set({ ai: { ...s.ai, minConvictionToAsk: v } })} />
-                </Field>
-                <Field label="cooldown (seconds per instrument)">
-                  <NumberInput
-                    value={Math.round(s.ai.cooldownMs / 1000)}
-                    onChangeValue={(v) => set({ ai: { ...s.ai, cooldownMs: Math.max(15, v) * 1000 } })}
-                  />
-                </Field>
-                <Field label="monthly AI budget (EUR)" hint="hard circuit breaker across manual and automatic calls">
-                  <NumberInput value={s.aiMonthlyBudgetEur} min={0} max={10} step={0.5} onChangeValue={(v) => set({ aiMonthlyBudgetEur: Math.min(10, Math.max(0, v)) })} data-testid="settings-ai-budget" />
-                </Field>
-                <Field label="enabled">
-                  <Switch checked={s.ai.enabled} onChange={(v) => set({ ai: { ...s.ai, enabled: v } })} label="consult the AI risk officer" />
-                </Field>
-              </div>
-              {health.data && (
-                <div className="mt-3 grid gap-x-6 sm:grid-cols-2">
-                  <Row label="calls" value={health.data.ai.calls.toString()} />
-                  <Row label="cache hits" value={health.data.ai.cacheHits.toString()} />
-                  <Row label="tokens in / out" value={`${health.data.ai.tokensIn.toLocaleString('en-US')} / ${health.data.ai.tokensOut.toLocaleString('en-US')}`} />
-                  <Row label="errors" value={health.data.ai.errors.toString()} tone={health.data.ai.errors ? 'warning' : undefined} />
-                  {health.data.ai.lastError && <Row label="last error" value={health.data.ai.lastError} mono={false} tone="warning" />}
-                </div>
-              )}
-            </TabPanel>
-
-            <TabPanel id="scanner">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label="scan timeframe">
-                  <Select value={s.scanner.timeframe} onChange={(e) => set({ scanner: { ...s.scanner, timeframe: e.target.value } })}>
-                    {BARS.map((b) => (
-                      <option key={b}>{b}</option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="instrument types">
-                  <Select
-                    value={s.scanner.instTypes.join(',')}
-                    onChange={(e) => set({ scanner: { ...s.scanner, instTypes: e.target.value.split(',') } })}
-                  >
-                    <option value="SWAP">Perpetual swaps</option>
-                    <option value="SPOT">Spot</option>
-                    <option value="SWAP,SPOT">Swaps + spot</option>
-                    <option value="SWAP,SPOT,FUTURES">Everything</option>
-                  </Select>
-                </Field>
-                <Field label="quote currency">
-                  <Select value={s.scanner.quoteCcy} onChange={(e) => set({ scanner: { ...s.scanner, quoteCcy: e.target.value } })}>
-                    {['USDT', 'USDC', 'USD', ''].map((q) => (
-                      <option key={q || 'any'} value={q}>
-                        {q || 'any'}
-                      </option>
-                    ))}
-                  </Select>
-                </Field>
-                <Field label="minimum 24h turnover (USD)">
-                  <NumberInput value={s.scanner.minVol24hUsd} onChangeValue={(v) => set({ scanner: { ...s.scanner, minVol24hUsd: v } })} />
-                </Field>
-                <Field label="scheduled research interval (hours)" hint="minimum 6 hours; resource governor may defer a run">
-                  <NumberInput value={s.researchIntervalHours} min={6} max={168} onChangeValue={(v) => set({ researchIntervalHours: Math.max(6, v) })} />
-                </Field>
-                <Field label={`universe size · ${s.scanner.universeSize}`} hint="deep-scanned instruments per cycle">
-                  <Slider value={s.scanner.universeSize} min={10} max={200} step={5} onChange={(v) => set({ scanner: { ...s.scanner, universeSize: v } })} />
-                </Field>
-                <Field label="scan interval (seconds)">
-                  <NumberInput
-                    value={Math.round(s.scanner.intervalMs / 1000)}
-                    onChangeValue={(v) => set({ scanner: { ...s.scanner, intervalMs: Math.max(15, v) * 1000 } })}
-                  />
-                </Field>
-                <div className="space-y-2">
-                  <Switch checked={s.scanner.enabled} onChange={(v) => set({ scanner: { ...s.scanner, enabled: v } })} label="scanner running" />
-                  <Switch
-                    checked={s.scanner.includeEquities}
-                    onChange={(v) => set({ scanner: { ...s.scanner, includeEquities: v } })}
-                    label="include tokenized equities (xStocks)"
-                  />
-                </div>
-              </div>
-            </TabPanel>
-
-            <TabPanel id="telegram">
-              <div className="grid gap-4 sm:grid-cols-2">
-                <Field label={`minimum conviction to notify · ${s.telegram.minConviction}`}>
-                  <Slider value={s.telegram.minConviction} min={0} max={95} onChange={(v) => set({ telegram: { ...s.telegram, minConviction: v } })} />
-                </Field>
-                <Field label="quiet hours (UTC)" hint="equal values disable quiet hours">
-                  <div className="flex items-center gap-2">
-                    <NumberInput value={s.telegram.quietHoursStart} onChangeValue={(v) => set({ telegram: { ...s.telegram, quietHoursStart: v } })} />
-                    <span className="text-muted-foreground">→</span>
-                    <NumberInput value={s.telegram.quietHoursEnd} onChangeValue={(v) => set({ telegram: { ...s.telegram, quietHoursEnd: v } })} />
-                  </div>
-                </Field>
-                <div className="space-y-2">
-                  <Switch checked={s.telegram.enabled} onChange={(v) => set({ telegram: { ...s.telegram, enabled: v } })} label="push notifications" />
-                  <Switch
-                    checked={s.telegram.onlyWatchlist}
-                    onChange={(v) => set({ telegram: { ...s.telegram, onlyWatchlist: v } })}
-                    label="only notify for watchlist instruments"
-                  />
-                </div>
-                <Field label="delivery test">
-                  <Button size="sm" variant="secondary" onClick={testTelegram} data-testid="settings-telegram-test">
-                    <Send className="h-3.5 w-3.5" />
-                    Send status card
-                  </Button>
-                </Field>
-              </div>
-              {health.data && (
-                <div className="mt-3 grid gap-x-6 sm:grid-cols-2">
-                  <Row label="bot" value={health.data.telegram.username ? `@${health.data.telegram.username}` : 'not configured'} mono={false} />
-                  <Row label="registered chats" value={health.data.telegram.chats.toString()} />
-                  <Row label="sent / failed" value={`${health.data.telegram.sent} / ${health.data.telegram.failed}`} />
-                  <Row label="commands received" value={health.data.telegram.received.toString()} />
-                </div>
-              )}
-              <p className="mt-3 rounded border border-border bg-card-2/50 p-2 text-[11px] leading-relaxed text-muted-foreground">
-                Send <span className="num">/start</span> to the bot from any Telegram account to register it. Commands:
-                <span className="num"> /status /analyze BTC 15m /watch NVDA 1H /unwatch /list /scan /settings /mute</span>.
-              </p>
-            </TabPanel>
-          </div>
-        </Tabs>
-      </Panel>
-
-      <div className="flex flex-col gap-3 xl:col-span-4">
-        <Panel title="Live engine state">
-          {health.data ? (
-            <div className="space-y-0.5">
-              <Row label="engine" value={health.data.engineEnabled ? 'running' : 'paused'} tone={health.data.engineEnabled ? 'bull' : 'warning'} mono={false} />
-              <Row label="uptime" value={`${Math.floor(health.data.uptimeSec / 60)}m`} />
-              <Row label="focus" value={`${health.data.focus.instId} ${health.data.focus.timeframe}`} />
-              <Row label="instruments" value={health.data.universe.instruments.toLocaleString('en-US')} />
-              <Row label="candle series" value={`${health.data.memory.series} · ${health.data.memory.bars.toLocaleString('en-US')} bars`} />
-              <Row label="gaps detected" value={health.data.memory.gaps.toString()} />
-              <Row label="evaluations" value={health.data.counters.evaluations.toLocaleString('en-US')} />
-              <Row label="alerts fired" value={health.data.counters.alerts.toString()} />
-              <Row label="ideas journaled" value={health.data.counters.signals.toString()} />
-              <Row label="REST calls" value={`${health.data.rest.calls} · ${health.data.rest.avgLatencyMs.toFixed(0)}ms`} />
-              <Row label="WS messages" value={health.data.counters.wsMessages.toLocaleString('en-US')} />
-              <Row label="last scan" value={ago(health.data.scanner.at)} mono={false} />
-              <Row label="convex" value={`${health.data.convex.status} · ${health.data.convex.writes}w / ${health.data.convex.reads}r`} mono={false} />
-              {health.data.account && (
-                <>
-                  <Row label="account equity" value={fmtUsd(health.data.account.totalEquityUsd)} />
-                  <Row label="free USDT" value={fmtUsd(health.data.account.availableUsdt)} />
-                </>
-              )}
-            </div>
-          ) : (
-            <div className="skeleton h-40 rounded" />
-          )}
-        </Panel>
-
-        <Panel title="Data sources">
-          <div className="space-y-1.5 text-[11px] leading-relaxed text-muted-foreground">
-            <p>
-              <Badge tone="bull">OKX v5</Badge> public REST + two WebSocket families for candles, tickers, funding, open
-              interest, order book and index prices. No key required for market data.
-            </p>
-            <p>
-              <Badge tone="info">SQLite WAL</Badge> is the local source of truth for settings, candidates, paper events, research and operations. Convex is an optional mirror only.
-            </p>
-            <p>
-              <Badge tone="plain">Gemini</Badge> is consulted only when the local stack finds a real setup, with a dense
-              pre-computed brief and a response cache.
-            </p>
-          </div>
-        </Panel>
-      </div>
-    </div>
+    <label className="flex flex-col gap-1 py-1.5">
+      <span className="text-[11px] font-medium">{label}</span>
+      {children}
+      {hint && <span className="text-[10px] leading-snug text-muted-foreground">{hint}</span>}
+    </label>
   )
 }
 
-function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+export default function SettingsPage() {
+  const [settings, setSettings] = useState<EngineSettings | null>(null)
+  const [savedAt, setSavedAt] = useState<number>(0)
+  const [state, setState] = useState<SaveState>('idle')
+  const [errors, setErrors] = useState<string[]>([])
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [tab, setTab] = useState('signal')
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    void api<EngineSettings>('/settings')
+      .then((next) => {
+        setSettings(next)
+        setSavedAt(next.savedAt ?? 0)
+      })
+      .catch((err) => setLoadError(err instanceof Error ? err.message : 'failed to load settings'))
+  }, [])
+
+  /**
+   * Every change is written straight to SQLite and read back, so what you see on
+   * this page is exactly what the engine will use on the next tick.
+   */
+  const save = async (patch: Record<string, unknown>) => {
+    setState('saving')
+    setErrors([])
+    try {
+      const next = await post<EngineSettings>('/settings', patch)
+      setSettings(next)
+      setSavedAt(next.savedAt ?? Date.now())
+      setState('saved')
+      if (timer.current) clearTimeout(timer.current)
+      timer.current = setTimeout(() => setState('idle'), 2200)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'save failed'
+      setErrors([message])
+      setState('error')
+      toast.error(`Rejected: ${message}`)
+    }
+  }
+
+  if (loadError) return <div className="p-4"><ErrorNote message={loadError} /></div>
+  if (!settings)
+    return (
+      <div className="mx-auto max-w-[1100px] space-y-3 p-4">
+        <Skeleton className="h-24" />
+        <Skeleton className="h-64" />
+      </div>
+    )
+
+  const s = settings
+
   return (
-    <label className="block">
-      <span className="mb-1 block text-[11px] text-muted-foreground">{label}</span>
-      {children}
-      {hint && <span className="mt-1 block text-[10px] text-muted-foreground/70">{hint}</span>}
-    </label>
+    <div className="mx-auto w-full max-w-[1100px] space-y-3 p-3 pb-24 sm:p-4 md:pb-4" data-testid="settings-page">
+      {/* ---- persistent save banner: the old build silently reverted edits ---- */}
+      <div className="sticky top-[52px] z-30 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card px-3 py-2">
+        <span className="text-[13px] font-medium">Configuration</span>
+        <Badge tone={s.engineEnabled ? 'bull' : 'warning'}>{s.engineEnabled ? 'engine running' : 'engine paused'}</Badge>
+        <div className="ml-auto flex items-center gap-2" data-testid="settings-save-state">
+          {state === 'saving' && (
+            <span className="flex items-center gap-1 text-[11px] text-info">
+              <Loader2 className="h-3 w-3 animate-spin" /> saving
+            </span>
+          )}
+          {state === 'saved' && (
+            <span className="flex items-center gap-1 text-[11px] text-bull">
+              <Check className="h-3 w-3" /> saved to disk
+            </span>
+          )}
+          {state === 'error' && (
+            <span className="flex items-center gap-1 text-[11px] text-bear">
+              <CircleAlert className="h-3 w-3" /> rejected
+            </span>
+          )}
+          <span className="text-[10px] text-muted-foreground">{savedAt ? `last saved ${ago(savedAt)}` : 'defaults'}</span>
+          <Button variant="secondary" onClick={() => void save({})} data-testid="settings-verify">
+            <Save className="h-3.5 w-3.5" /> verify
+          </Button>
+        </div>
+      </div>
+      {errors.length > 0 && <ErrorNote message={errors.join(' · ')} />}
+
+      <Tabs value={tab} onChange={setTab}>
+        <TabList>
+          <Tab id="signal">Signal</Tab>
+          <Tab id="risk">Risk</Tab>
+          <Tab id="evolution">Evolution</Tab>
+          <Tab id="execution">Execution</Tab>
+          <Tab id="scanner">Scanner</Tab>
+          <Tab id="telegram">Telegram</Tab>
+          <Tab id="ai">AI budget</Tab>
+        </TabList>
+
+        {/* ------------------------------------------------------- signal --- */}
+        <TabPanel id="signal" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="Focus" subtitle="what the terminal analyses every 4 seconds">
+            <Field label="Instrument">
+              <input
+                className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-sm focus:border-ring/60 focus:outline-none focus:ring-2 focus:ring-ring/25"
+                defaultValue={s.instId}
+                onBlur={(event) => event.target.value !== s.instId && void save({ instId: event.target.value.trim().toUpperCase() })}
+                data-testid="settings-instId"
+              />
+            </Field>
+            <Field label="Entry timeframe">
+              <Select value={s.timeframe} onChange={(event) => void save({ timeframe: event.target.value })} data-testid="settings-timeframe">
+                {BARS.map((bar) => (
+                  <option key={bar} value={bar}>{bar}</option>
+                ))}
+              </Select>
+            </Field>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Higher timeframe">
+                <Select value={s.htfTimeframe} onChange={(event) => void save({ htfTimeframe: event.target.value })}>
+                  {BARS.map((bar) => (
+                    <option key={bar} value={bar}>{bar}</option>
+                  ))}
+                </Select>
+              </Field>
+              <Field label="Context timeframe">
+                <Select value={s.htf2Timeframe} onChange={(event) => void save({ htf2Timeframe: event.target.value })}>
+                  {BARS.map((bar) => (
+                    <option key={bar} value={bar}>{bar}</option>
+                  ))}
+                </Select>
+              </Field>
+            </div>
+            <Field label="Strategy filter" hint="which playbook family may be returned; the committee still decides whether to act">
+              <Select value={s.strategy} onChange={(event) => void save({ strategy: event.target.value })} data-testid="settings-strategy">
+                {STRATEGIES.map((value) => (
+                  <option key={value} value={value}>{value}</option>
+                ))}
+              </Select>
+            </Field>
+          </Panel>
+
+          <Panel title="Gates" subtitle="deliberately permissive at the start so the system can generate evidence">
+            <Field label="Minimum conviction" hint="below this, nothing is armed">
+              <NumberInput value={s.minConfidence} onChangeValue={(value) => void save({ minConfidence: value })} data-testid="settings-minConfidence" />
+            </Field>
+            <Field label="Minimum composite score">
+              <NumberInput value={s.minCompositeScore} onChangeValue={(value) => void save({ minCompositeScore: value })} />
+            </Field>
+            <Field label="Minimum ADX">
+              <NumberInput value={s.minAdx} onChangeValue={(value) => void save({ minAdx: value })} />
+            </Field>
+            <Field label="Maximum ATR %">
+              <NumberInput value={s.maxAtrPct} onChangeValue={(value) => void save({ maxAtrPct: value })} />
+            </Field>
+            <div className="space-y-2 pt-2">
+              <Switch checked={s.requireMtfAlignment} onChange={(value) => void save({ requireMtfAlignment: value })} label="require multi-timeframe alignment" />
+              <Switch checked={s.usePatterns} onChange={(value) => void save({ usePatterns: value })} label="candlestick patterns" />
+              <Switch checked={s.useDerivatives} onChange={(value) => void save({ useDerivatives: value })} label="funding / OI / positioning" />
+              <Switch checked={s.useEmpiricalEdge} onChange={(value) => void save({ useEmpiricalEdge: value })} label="empirical analogue scan" />
+              <Switch checked={s.engineEnabled} onChange={(value) => void save({ engineEnabled: value })} label="engine enabled" data-testid="settings-engineEnabled" />
+            </div>
+          </Panel>
+
+          <Panel title="Factor weights" subtitle="0 disables a family entirely" className="md:col-span-2">
+            <div className="grid grid-cols-2 gap-x-4 sm:grid-cols-3 lg:grid-cols-5">
+              {Object.entries(s.weights).map(([name, value]) => (
+                <Field key={name} label={name}>
+                  <NumberInput value={value} step={0.1} onChangeValue={(next) => void save({ weights: { [name]: next } })} data-testid={`settings-weight-${name}`} />
+                </Field>
+              ))}
+            </div>
+          </Panel>
+        </TabPanel>
+
+        {/* --------------------------------------------------------- risk --- */}
+        <TabPanel id="risk" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="Per trade">
+            <Field label="Risk per trade (%)">
+              <NumberInput value={s.riskPerTradePct} step={0.05} onChangeValue={(value) => void save({ riskPerTradePct: value })} data-testid="settings-riskPerTradePct" />
+            </Field>
+            <Field label="Maximum leverage">
+              <NumberInput value={s.leverage} onChangeValue={(value) => void save({ leverage: value })} />
+            </Field>
+            <Field label="Minimum reward:risk">
+              <NumberInput value={s.rrRatio} step={0.1} onChangeValue={(value) => void save({ rrRatio: value })} />
+            </Field>
+            <Field label="Taker fee (bps)">
+              <NumberInput value={s.takerFeeBps} step={0.5} onChangeValue={(value) => void save({ takerFeeBps: value })} />
+            </Field>
+          </Panel>
+          <Panel title="Portfolio" subtitle="enforced before any candidate is armed">
+            <Field label="Paper equity (USD)" hint="replaced by the real demo balance when account sync is on">
+              <NumberInput value={s.equityUsd} onChangeValue={(value) => void save({ equityUsd: value })} />
+            </Field>
+            <Switch checked={s.useAccountBalance} onChange={(value) => void save({ useAccountBalance: value })} label="use the OKX account balance" />
+            <Field label="Max open positions">
+              <NumberInput value={s.maxOpenPositions} onChangeValue={(value) => void save({ maxOpenPositions: value })} data-testid="settings-maxOpenPositions" />
+            </Field>
+            <Field label="Daily loss limit (R)">
+              <NumberInput value={s.maxDailyLossPct} step={0.5} onChangeValue={(value) => void save({ maxDailyLossPct: value })} />
+            </Field>
+            <Field label="Max aggregate open risk (%)">
+              <NumberInput value={s.maxOpenRiskPct} step={0.5} onChangeValue={(value) => void save({ maxOpenRiskPct: value })} />
+            </Field>
+            <Field label="Max gross exposure (%)">
+              <NumberInput value={s.maxGrossExposurePct} step={10} onChangeValue={(value) => void save({ maxGrossExposurePct: value })} />
+            </Field>
+          </Panel>
+        </TabPanel>
+
+        {/* ---------------------------------------------------- evolution --- */}
+        <TabPanel id="evolution" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="Search" subtitle="bounded on purpose: the live engine always has CPU priority">
+            <Switch checked={s.evolution.enabled} onChange={(value) => void save({ evolution: { enabled: value } })} label="self-improvement enabled" data-testid="settings-evolution-enabled" />
+            <Field label="Population size" hint="models trained per generation">
+              <NumberInput value={s.evolution.populationSize} onChangeValue={(value) => void save({ evolution: { populationSize: value } })} data-testid="settings-populationSize" />
+            </Field>
+            <Field label="Generations per cycle">
+              <NumberInput value={s.evolution.generations} onChangeValue={(value) => void save({ evolution: { generations: value } })} />
+            </Field>
+            <Field label="Cycle interval (minutes)">
+              <NumberInput value={s.evolution.intervalMinutes} onChangeValue={(value) => void save({ evolution: { intervalMinutes: value } })} />
+            </Field>
+          </Panel>
+          <Panel title="Birth gates" subtitle="what a challenger must prove before it exists">
+            <Field label="Minimum samples per niche" hint="labelled, resolved outcomes">
+              <NumberInput value={s.evolution.minNicheSamples} onChangeValue={(value) => void save({ evolution: { minNicheSamples: value } })} data-testid="settings-minNicheSamples" />
+            </Field>
+            <Field label="New samples before re-evolving">
+              <NumberInput value={s.evolution.minNewSamples} onChangeValue={(value) => void save({ evolution: { minNewSamples: value } })} />
+            </Field>
+            <Field label="Minimum Brier skill" hint="out-of-sample improvement over the base rate; 0.01 is already meaningful">
+              <NumberInput value={s.evolution.minBrierSkill} step={0.01} onChangeValue={(value) => void save({ evolution: { minBrierSkill: value } })} />
+            </Field>
+            <Switch
+              checked={s.evolution.placebo}
+              onChange={(value) => void save({ evolution: { placebo: value } })}
+              label="require beating the shuffled-label placebo"
+              data-testid="settings-placebo"
+            />
+          </Panel>
+          <Panel title="Promotion &amp; rollback" subtitle="forward evidence only, never backfilled" className="md:col-span-2">
+            <div className="grid gap-x-4 sm:grid-cols-3">
+              <Field label="Canary trades before promotion">
+                <NumberInput value={s.evolution.canaryMinTrades} onChangeValue={(value) => void save({ evolution: { canaryMinTrades: value } })} />
+              </Field>
+              <Field label="Rollback window (trades)">
+                <NumberInput value={s.evolution.rollbackWindow} onChangeValue={(value) => void save({ evolution: { rollbackWindow: value } })} />
+              </Field>
+              <Field label="Rollback drawdown (R)">
+                <NumberInput value={s.evolution.rollbackMaxDrawdownR} step={0.5} onChangeValue={(value) => void save({ evolution: { rollbackMaxDrawdownR: value } })} />
+              </Field>
+            </div>
+          </Panel>
+        </TabPanel>
+
+        {/* ---------------------------------------------------- execution --- */}
+        <TabPanel id="execution" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="OKX demo mirroring" subtitle="armed candidates become real orders on the simulated account">
+            <Switch checked={s.execution.okxDemoEnabled} onChange={(value) => void save({ execution: { okxDemoEnabled: value } })} label="place real demo orders" data-testid="settings-okxDemoEnabled" />
+            <Field label="Max concurrent demo orders">
+              <NumberInput value={s.execution.maxConcurrentDemoOrders} onChangeValue={(value) => void save({ execution: { maxConcurrentDemoOrders: value } })} />
+            </Field>
+            <Field label="Size multiplier" hint="scales the risk-derived size before rounding to the instrument lot size">
+              <NumberInput value={s.execution.demoSizeMultiplier} step={0.1} onChangeValue={(value) => void save({ execution: { demoSizeMultiplier: value } })} />
+            </Field>
+            <Field label="Markets" hint="a cash spot account cannot short, so SHORT candidates on SPOT are skipped automatically">
+              <div className="flex flex-wrap gap-3 pt-1">
+                {(['SWAP', 'SPOT'] as const).map((type) => (
+                  <Switch
+                    key={type}
+                    checked={s.execution.demoInstTypes.includes(type)}
+                    onChange={(value) => {
+                      const next = value ? [...new Set([...s.execution.demoInstTypes, type])] : s.execution.demoInstTypes.filter((row) => row !== type)
+                      if (!next.length) {
+                        toast.error('At least one market must stay enabled')
+                        return
+                      }
+                      void save({ execution: { demoInstTypes: next } })
+                    }}
+                    label={type}
+                  />
+                ))}
+              </div>
+            </Field>
+          </Panel>
+          <Panel title="Research schedule">
+            <Switch checked={s.autoResearchEnabled} onChange={(value) => void save({ autoResearchEnabled: value })} label="automatic research campaigns" />
+            <Field label="Campaign interval (hours)">
+              <NumberInput value={s.researchIntervalHours} onChangeValue={(value) => void save({ researchIntervalHours: value })} />
+            </Field>
+            <p className="pt-2 text-[10px] leading-relaxed text-muted-foreground">
+              Campaigns are evidence-triggered first: the dominant exit-attribution bucket picks the hypothesis, and the scheduled rotation is only the fallback.
+            </p>
+          </Panel>
+        </TabPanel>
+
+        {/* ------------------------------------------------------ scanner --- */}
+        <TabPanel id="scanner" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="Universe">
+            <Switch checked={s.scanner.enabled} onChange={(value) => void save({ scanner: { enabled: value } })} label="scanner enabled" data-testid="settings-scanner-enabled" />
+            <Field label="Scanner timeframe">
+              <Select value={s.scanner.timeframe} onChange={(event) => void save({ scanner: { timeframe: event.target.value } })}>
+                {BARS.map((bar) => (
+                  <option key={bar} value={bar}>{bar}</option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="Instrument types">
+              <div className="flex flex-wrap gap-3 pt-1">
+                {INST_TYPES.map((type) => (
+                  <Switch
+                    key={type}
+                    checked={s.scanner.instTypes.includes(type)}
+                    onChange={(value) => {
+                      const next = value ? [...new Set([...s.scanner.instTypes, type])] : s.scanner.instTypes.filter((row) => row !== type)
+                      if (!next.length) {
+                        toast.error('At least one instrument type must stay enabled')
+                        return
+                      }
+                      void save({ scanner: { instTypes: next } })
+                    }}
+                    label={type}
+                  />
+                ))}
+              </div>
+            </Field>
+            <Switch checked={s.scanner.includeEquities} onChange={(value) => void save({ scanner: { includeEquities: value } })} label="include tokenised equities" />
+          </Panel>
+          <Panel title="Filters">
+            <Field label="Universe size" hint="top N by 24h turnover">
+              <NumberInput value={s.scanner.universeSize} onChangeValue={(value) => void save({ scanner: { universeSize: value } })} data-testid="settings-universeSize" />
+            </Field>
+            <Field label="Minimum 24h volume (USD)">
+              <NumberInput value={s.scanner.minVol24hUsd} step={1_000_000} onChangeValue={(value) => void save({ scanner: { minVol24hUsd: value } })} />
+            </Field>
+            <Field label="Scan interval (ms)">
+              <NumberInput value={s.scanner.intervalMs} step={5000} onChangeValue={(value) => void save({ scanner: { intervalMs: value } })} />
+            </Field>
+            <Field label="Quote currency">
+              <input
+                className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-sm focus:border-ring/60 focus:outline-none focus:ring-2 focus:ring-ring/25"
+                defaultValue={s.scanner.quoteCcy}
+                onBlur={(event) => event.target.value !== s.scanner.quoteCcy && void save({ scanner: { quoteCcy: event.target.value.trim().toUpperCase() } })}
+              />
+            </Field>
+          </Panel>
+        </TabPanel>
+
+        {/* ----------------------------------------------------- telegram --- */}
+        <TabPanel id="telegram" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="What the bot sends">
+            <Switch checked={s.telegram.enabled} onChange={(value) => void save({ telegram: { enabled: value } })} label="telegram enabled" data-testid="settings-telegram-enabled" />
+            <div className="space-y-2 pt-1">
+              <Switch checked={s.telegram.signalCards} onChange={(value) => void save({ telegram: { signalCards: value } })} label="signal cards" />
+              <Switch checked={s.telegram.orderCards} onChange={(value) => void save({ telegram: { orderCards: value } })} label="order placed / filled / closed" />
+              <Switch checked={s.telegram.evolutionEvents} onChange={(value) => void save({ telegram: { evolutionEvents: value } })} label="generations, promotions, rollbacks" data-testid="settings-evolutionEvents" />
+              <Switch checked={s.telegram.dailyDigest} onChange={(value) => void save({ telegram: { dailyDigest: value } })} label="daily digest" />
+              <Switch checked={s.telegram.onlyWatchlist} onChange={(value) => void save({ telegram: { onlyWatchlist: value } })} label="watchlist instruments only" />
+            </div>
+          </Panel>
+          <Panel title="Timing">
+            <Field label="Minimum conviction for a signal card">
+              <NumberInput value={s.telegram.minConviction} onChangeValue={(value) => void save({ telegram: { minConviction: value } })} />
+            </Field>
+            <Field label="Digest hour (UTC)">
+              <NumberInput value={s.telegram.digestHourUtc} onChangeValue={(value) => void save({ telegram: { digestHourUtc: value } })} />
+            </Field>
+            <Field label="Heartbeat interval (hours)" hint="0 disables the uptime heartbeat">
+              <NumberInput value={s.telegram.heartbeatHours} onChangeValue={(value) => void save({ telegram: { heartbeatHours: value } })} />
+            </Field>
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Quiet hours start (UTC)">
+                <NumberInput value={s.telegram.quietHoursStart} onChangeValue={(value) => void save({ telegram: { quietHoursStart: value } })} />
+              </Field>
+              <Field label="Quiet hours end (UTC)">
+                <NumberInput value={s.telegram.quietHoursEnd} onChangeValue={(value) => void save({ telegram: { quietHoursEnd: value } })} />
+              </Field>
+            </div>
+            <Button
+              variant="secondary"
+              className="mt-2"
+              onClick={() => void post('/telegram/test').then(() => toast.success('Test message sent')).catch((err) => toast.error(err instanceof Error ? err.message : 'Failed'))}
+              data-testid="settings-telegram-test"
+            >
+              Send a test message
+            </Button>
+          </Panel>
+        </TabPanel>
+
+        {/* ----------------------------------------------------------- ai --- */}
+        <TabPanel id="ai" className="grid gap-3 pt-3 md:grid-cols-2">
+          <Panel title="Budget" subtitle="a hard application-level circuit breaker, checked before every call">
+            <Field label="Monthly budget (EUR)" hint="maximum 10; the engine stops calling Gemini once the ledger reaches this">
+              <NumberInput value={s.aiMonthlyBudgetEur} step={0.5} onChangeValue={(value) => void save({ aiMonthlyBudgetEur: value })} data-testid="settings-aiBudget" />
+            </Field>
+            <Switch checked={s.ai.enabled} onChange={(value) => void save({ ai: { enabled: value } })} label="AI narrative enabled" />
+            <p className="pt-2 text-[10px] leading-relaxed text-muted-foreground">
+              The LLM never sets a probability, a size or an order. It only writes the narrative and the post-mortem. Every number on this dashboard comes from deterministic maths or a calibrated local model.
+            </p>
+          </Panel>
+          <Panel title="Model">
+            <Field label="Model id">
+              <input
+                className="h-8 w-full rounded-md border border-border bg-background px-2.5 text-sm focus:border-ring/60 focus:outline-none focus:ring-2 focus:ring-ring/25"
+                defaultValue={s.ai.model}
+                onBlur={(event) => event.target.value !== s.ai.model && void save({ ai: { model: event.target.value.trim() } })}
+              />
+            </Field>
+            <Field label="Ask only above conviction">
+              <NumberInput value={s.ai.minConvictionToAsk} onChangeValue={(value) => void save({ ai: { minConvictionToAsk: value } })} />
+            </Field>
+            <Field label="Cooldown (ms)">
+              <NumberInput value={s.ai.cooldownMs} step={30000} onChangeValue={(value) => void save({ ai: { cooldownMs: value } })} />
+            </Field>
+            <Field label="Max output tokens">
+              <NumberInput value={s.ai.maxOutputTokens} step={100} onChangeValue={(value) => void save({ ai: { maxOutputTokens: value } })} />
+            </Field>
+          </Panel>
+        </TabPanel>
+      </Tabs>
+    </div>
   )
 }

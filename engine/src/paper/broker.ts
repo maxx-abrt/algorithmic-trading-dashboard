@@ -39,6 +39,10 @@ export function createPaperPlan(input: {
   quantity?: number
   atrAtEntry: number
   fundingRate8h?: number
+  instType?: string
+  features?: number[]
+  featureSchema?: string
+  committee?: PaperPlan['committee']
 }): PaperPlan {
   return {
     id: input.id,
@@ -65,6 +69,10 @@ export function createPaperPlan(input: {
     fundingRate8h: input.fundingRate8h,
     atrAtEntry: input.atrAtEntry,
     trailAtrMult: input.plan.trailAtrMult,
+    instType: input.instType,
+    features: input.features,
+    featureSchema: input.featureSchema,
+    committee: input.committee ?? null,
   }
 }
 

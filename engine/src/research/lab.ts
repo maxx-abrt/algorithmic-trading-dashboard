@@ -16,7 +16,6 @@ import { trainEnsemble } from './ensemble.js'
 import { analyzeFeatureImportance } from './feature-importance.js'
 import { runCPCV } from './cpcv.js'
 import { applyTripleBarrier } from './triple-barrier.js'
-import type { ChampionService } from './champion.js'
 import { getCachedMarketContext } from '../quant/market-context.js'
 import { buildFeatureVector, FEATURE_ORDER } from './features.js'
 import { generateModelName } from './naming.js'
@@ -24,6 +23,7 @@ import { log } from '../log.js'
 
 export type CampaignType =
   | 'baseline'          // Standard BTC+ETH walk-forward with full 32-feature vector
+  | 'spot_swap'         // Same playbooks on SPOT and SWAP to learn venue-specific behaviour
   | 'multi_symbol'      // Diversify across 3+ symbols to test generalization
   | 'timeframe_sweep'   // Test 5m vs 15m vs 1H to find best timeframe
   | 'ensemble'          // Train ensemble stack (logistic + kNN + NB + stumps)
@@ -52,6 +52,8 @@ export interface CampaignResult {
   trials: { symbol: string; metrics: ReturnType<typeof validationMetrics>; folds: number }[]
   promotionReasons: string[]
   manifestHash: string
+  /** point-in-time training samples harvested for the evolution store */
+  samplesEmitted: number
 }
 
 const closedAt = (candle: Candle, timeframe: string) => {
@@ -80,6 +82,16 @@ export const CAMPAIGN_CONFIGS: Record<CampaignType, CampaignConfig> = {
     useTripleBarrier: false,
     minConfidence: 55,
     minCompositeScore: 15,
+  },
+  spot_swap: {
+    symbols: ['BTC-USDT-SWAP', 'BTC-USDT', 'ETH-USDT-SWAP', 'ETH-USDT'],
+    timeframe: '15m',
+    maxEvaluations: 60,
+    hypothesis: 'The same playbook behaves differently on SPOT and SWAP; a venue-specific specialist beats one shared model.',
+    useEnsemble: false,
+    useTripleBarrier: false,
+    minConfidence: 50,
+    minCompositeScore: 10,
   },
   multi_symbol: {
     symbols: ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'SOL-USDT-SWAP'],
@@ -166,7 +178,11 @@ export const CAMPAIGN_CONFIGS: Record<CampaignType, CampaignConfig> = {
 export class ResearchLab {
   private running = false
 
-  constructor(private readonly store: DurableStore, private readonly champion?: ChampionService) {}
+  constructor(
+    private readonly store: DurableStore,
+    /** every closed historical trade is emitted here as an immutable training sample */
+    private readonly sink?: (sample: { at: number; symbol: string; features: number[]; label: 0 | 1; netR?: number; horizonEndAt?: number; instType: string; timeframe: string; playbook: string; tradeId?: string }) => void,
+  ) {}
 
   governor() {
     const rssMb = process.memoryUsage().rss / 1024 / 1024
@@ -201,7 +217,7 @@ export class ResearchLab {
       const manifest = { symbols, timeframe, maxEvaluations, hypothesis, gate, createdAt: Date.now() }
       const result: CampaignResult = {
         id: campaignId, status: 'rejected_by_governor', validationState: 'NO_VALIDATED_MODEL', hypothesis,
-        symbols, timeframe, trials: [], promotionReasons: gate.reasons, manifestHash: manifestHash(manifest),
+        symbols, timeframe, trials: [], promotionReasons: gate.reasons, manifestHash: manifestHash(manifest), samplesEmitted: 0,
       }
       this.store.upsertCampaign({ id: campaignId, status: result.status, hypothesis, budget: gate, manifest })
       return result
@@ -213,15 +229,21 @@ export class ResearchLab {
       policyVersion: 'explicit-playbooks-v1', brokerVersion: 'paper-broker-v1',
       validation: { folds: 4, purgeBars: 12, embargoBars: 12 }, createdAt: Date.now(),
     }
-    this.store.upsertCampaign({ id: campaignId, status: 'running', hypothesis, budget: { maxEvaluations, maxRssMb: gate.maxRssMb }, manifest })
+    this.store.upsertCampaign({ id: campaignId, status: 'running', hypothesis, budget: { maxEvaluations, maxRssMb: gate.maxRssMb }, manifest: { ...manifest, campaignType } })
 
     try {
-      const [specRows, tickerRows] = await Promise.all([fetchInstruments('SWAP'), fetchTickers('SWAP')])
-      const specs = new Map(specRows.map((row) => [row.instId, row] as const))
-      const tickers = new Map(tickerRows.map((row) => [row.instId, row] as const))
+      const [swapSpecs, spotSpecs, swapTickers, spotTickers] = await Promise.all([
+        fetchInstruments('SWAP'),
+        fetchInstruments('SPOT'),
+        fetchTickers('SWAP'),
+        fetchTickers('SPOT'),
+      ])
+      const specs = new Map([...swapSpecs, ...spotSpecs].map((row) => [row.instId, row] as const))
+      const tickers = new Map([...swapTickers, ...spotTickers].map((row) => [row.instId, row] as const))
       const trials: CampaignResult['trials'] = []
       const allTrades: PaperTrade[] = []
       const labelledFeatures: LabelledFeatureRow[] = []
+      let samplesEmitted = 0
       const metaLabelledFeatures: LabelledFeatureRow[] = []
 
       for (const symbol of symbols) {
@@ -328,6 +350,19 @@ export class ResearchLab {
               features,
               label,
             })
+            samplesEmitted++
+            this.sink?.({
+              at: availableAt,
+              symbol,
+              features,
+              label,
+              netR: trade.netRealizedR,
+              horizonEndAt: trade.closedAt ?? availableAt,
+              instType: spec.instType,
+              timeframe,
+              playbook: selected.playbook,
+              tradeId: trade.id,
+            })
           }
         }
 
@@ -425,7 +460,7 @@ export class ResearchLab {
       const validationState = promotionReasons.length === 0 ? 'SHADOW_CANDIDATE' : 'NO_VALIDATED_MODEL'
       const result: CampaignResult = {
         id: campaignId, status: 'completed', validationState, hypothesis, symbols, timeframe, trials,
-        promotionReasons, manifestHash: manifestHash(manifest),
+        promotionReasons, manifestHash: manifestHash(manifest), samplesEmitted,
       }
       this.store.registerModel({
         id: `model:${result.manifestHash.slice(0, 16)}`, state: validationState === 'SHADOW_CANDIDATE' ? 'shadow_candidate' : 'rejected',
@@ -447,19 +482,7 @@ export class ResearchLab {
         displayName: generateModelName(),
         generation: 1,
       })
-      // Champion promotion hook: evaluate the candidate and start canary if appropriate
-      if (validationState === 'SHADOW_CANDIDATE' && (request.autoPromote ?? true) && this.champion) {
-        const modelId = `model:${result.manifestHash.slice(0, 16)}`
-        const evaluation = this.champion.evaluateCandidate(result)
-        if (evaluation.shouldCanary) {
-          this.champion.startCanary(modelId)
-          result.promotionReasons = [...result.promotionReasons, `auto_canary_started:${evaluation.reasons.join(',')}`]
-        } else {
-          this.store.retireModel(modelId, evaluation.reasons.join(','), 'retired')
-          result.promotionReasons = [...result.promotionReasons, `auto_promote_skipped:${evaluation.reasons.join(',')}`]
-        }
-      }
-      this.store.upsertCampaign({ id: campaignId, status: 'completed', hypothesis, budget: { maxEvaluations, symbols: symbols.length }, manifest: { ...manifest, result } })
+      this.store.upsertCampaign({ id: campaignId, status: 'completed', hypothesis, budget: { maxEvaluations, symbols: symbols.length }, manifest: { ...manifest, campaignType, result } })
       return result
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)

@@ -9,6 +9,7 @@ import { DecisionCard } from '@/components/terminal/decision-card'
 import { StrategyCandidates } from '@/components/terminal/strategy-candidates'
 import { EvidenceRail } from '@/components/terminal/evidence-rail'
 import { LogTerminal } from '@/components/terminal/log-terminal'
+import { CommitteePanel } from '@/components/terminal/committee-panel'
 import { Badge, Button, Panel, Row } from '@/components/ui/kit'
 import { cn } from '@/lib/utils'
 import { ago, fmtPct, fmtPrice, fmtUsd } from '@/lib/format'
@@ -232,6 +233,7 @@ export default function TerminalPage() {
         {/* right: decision + evidence */}
         <div className="flex min-w-0 flex-col gap-3 xl:col-span-4">
           <DecisionCard analysis={a} onAsk={askAi} asking={asking} />
+          <CommitteePanel instType={a?.instType ?? null} timeframe={a?.timeframe ?? bar} />
           <StrategyCandidates instId={instId} />
           <EvidenceRail analysis={a} />
 

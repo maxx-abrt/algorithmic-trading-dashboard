@@ -19,6 +19,8 @@ import { normalizeBar, OKX_BARS } from './quant/timeframes.js'
 import { ALERT_TYPES, ALERT_TYPE_LABELS } from './alerts/rules.js'
 import { signalCard, statusCard } from './telegram/cards.js'
 import { fetchDerivatives } from './okx/market.js'
+import { diskUsage, listBackups } from './store/backup.js'
+import { REASON_LABELS } from './paper/attribution.js'
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<unknown> | unknown
 
@@ -191,16 +193,19 @@ const routes: Record<string, Handler> = {
     return { ok: true }
   },
 
-  'GET /api/settings': () => runtime.settings,
+  'GET /api/settings': () => ({ ...runtime.settings, savedAt: runtime.settingsSavedAt }),
 
-  'POST /api/settings': async (req) => {
+  'POST /api/settings': async (req, res) => {
     const body = await readBody(req)
-    const settings = await runtime.updateSettings(body)
-    log.info('settings', `updated: ${Object.keys(body).join(', ')}`)
-    if (body.instId || body.timeframe) {
-      void runtime.analyzeInstrument(settings.instId, settings.timeframe, { withAi: false, silent: true })
+    const result = runtime.updateSettings(body)
+    if (!result.ok) {
+      json(res, 422, { ok: false, errors: result.errors, settings: result.settings, savedAt: result.savedAt })
+      return
     }
-    return settings
+    if (body.instId || body.timeframe) {
+      void runtime.analyzeInstrument(result.settings.instId, result.settings.timeframe, { withAi: false, silent: true })
+    }
+    return { ...result.settings, savedAt: result.savedAt, ok: true, errors: [] as string[] }
   },
 
   'GET /api/alerts': async (_req, _res, url) => ({
@@ -300,71 +305,68 @@ const routes: Record<string, Handler> = {
     })
   },
 
-  'GET /api/research/champion': () => {
-    const state = runtime.store.researchState()
-    const champion = runtime.champion.current
-    const health = runtime.champion.health()
-    const canaryTrades = state.canary ? runtime.store.listCanaryTrades(String((state.canary as Record<string, unknown>).id)) : []
-    const trainingRowCount = champion.modelId ? runtime.store.listTrainingRows(champion.modelId).length : 0
+  'GET /api/evolution': () => {
+    const snapshot = runtime.evolution.snapshot()
     return {
-      champion: champion.modelId ? state.champion : null,
-      championModel: champion,
-      canary: state.canary ?? null,
-      health,
-      canaryTrades: canaryTrades.length,
-      trainingRows: trainingRowCount,
+      ...snapshot,
+      settings: runtime.settings.evolution,
+      lineage: snapshot.specialists.map((row) => ({ hash: row.artifactHash, parent: row.parentHash, generation: row.generation, niche: row.nicheKey, name: row.displayName, lifecycle: row.lifecycle })),
     }
   },
 
-  'POST /api/research/promote': async (req) => {
+  'GET /api/harvest': () => ({ progress: runtime.harvester.progress, last: runtime.store.getState('harvest_last', null), niches: runtime.evolution.store.nicheCounts() }),
+
+  'POST /api/harvest/run': async (req) => {
     const body = await readBody(req)
-    const modelId = String(body.modelId ?? '')
-    if (!modelId) throw new Error('modelId required')
-    const result = runtime.champion.promote(modelId)
-    if (!result.ok) throw new Error(result.reason)
-    return { ok: true, modelId, reason: result.reason }
-  },
-
-  'POST /api/research/rollback': async (req) => {
-    const body = await readBody(req)
-    const reason = body.reason ? String(body.reason) : 'manual_rollback'
-    const result = runtime.champion.rollback(reason)
-    return result
-  },
-
-  'POST /api/research/retrain': async () => {
-    const result = runtime.champion.retrainChampion()
-    return result
-  },
-
-  'GET /api/research/models': () => {
-    const models = runtime.store.listAllModels(100)
-    return models.map((m) => {
-      const metrics = m.metrics_json as Record<string, unknown>
-      const trainingRows = runtime.store.listTrainingRows(m.id).length
-      return {
-        id: m.id,
-        displayName: m.display_name,
-        generation: m.generation,
-        version: m.version,
-        state: m.state,
-        createdAt: m.created_at,
-        promotedAt: m.promoted_at,
-        retiredAt: m.retired_at,
-        parentId: m.parent_id,
-        rollbackReason: m.rollback_reason,
-        canaryStatus: m.canary_status,
-        validationBrier: metrics.validationBrier ?? null,
-        trainedRows: metrics.trainedRows ?? null,
-        liveMeanR: m.live_mean_r,
-        liveWinRate: m.live_win_rate,
-        liveTrades: m.live_trades_count,
-        liveMaxDrawdownR: m.live_max_drawdown_r,
-        trainingRowsAccumulated: trainingRows,
-        artifactPath: m.artifact_path,
-      }
+    if (runtime.harvester.progress.running) return { queued: false, reason: 'already running', progress: runtime.harvester.progress }
+    void runtime.harvester.run({
+      symbols: Array.isArray(body.symbols) ? body.symbols.map(String) : undefined,
+      timeframes: Array.isArray(body.timeframes) ? body.timeframes.map(String) : undefined,
+      perType: body.perType == null ? undefined : Number(body.perType),
+      barsPerSymbol: body.barsPerSymbol == null ? undefined : Number(body.barsPerSymbol),
+      maxWallMs: body.maxWallMs == null ? undefined : Number(body.maxWallMs),
     })
+    return { queued: true, progress: runtime.harvester.progress }
   },
+
+  'POST /api/evolution/run': async (req) => {
+    const body = await readBody(req)
+    const eligible = runtime.evolution.eligibleNiches(runtime.settings)
+    const explicit = body.playbook && body.instType && body.timeframe
+      ? { playbook: String(body.playbook), instType: String(body.instType), timeframe: String(body.timeframe) }
+      : null
+    const target = explicit ?? eligible[0]?.niche
+    if (!target) {
+      const counts = runtime.evolution.store.nicheCounts()
+      throw new Error(`no niche has ${runtime.settings.evolution.minNicheSamples}+ labelled outcomes yet (largest: ${counts[0] ? `${counts[0].nicheKey} = ${counts[0].samples}` : 'none'})`)
+    }
+    return runtime.evolution.evolveOne(target, runtime.settings)
+  },
+
+  'POST /api/evolution/lifecycle': async (req) => {
+    const body = await readBody(req)
+    const hash = String(body.artifactHash ?? '')
+    const lifecycle = String(body.lifecycle ?? '')
+    if (!hash || !['shadow', 'canary', 'champion', 'retired', 'rejected'].includes(lifecycle)) throw new Error('artifactHash and a valid lifecycle are required')
+    const row = runtime.evolution.store.getSpecialist(hash)
+    if (!row) throw new Error('specialist not found')
+    runtime.evolution.store.setLifecycle(hash, lifecycle as 'champion', body.reason ? String(body.reason) : 'manual')
+    runtime.evolution.store.recordEvent({ type: lifecycle === 'champion' ? 'promoted' : 'retired', nicheKey: row.niche_key, artifactHash: hash, detail: `manual transition to ${lifecycle}` })
+    return { ok: true, artifactHash: hash, lifecycle }
+  },
+
+  'GET /api/attribution': (_req, _res, url) => ({
+    summary: runtime.evolution.store.attributionSummary(),
+    rows: runtime.evolution.store.listAttribution(num(url.searchParams.get('limit'), 200)),
+    labels: REASON_LABELS,
+  }),
+
+  'GET /api/execution': (_req, _res, url) => ({
+    demo: runtime.demo.health(),
+    parity: runtime.demo.parityReport(),
+    orders: runtime.evolution.store.listOrders(num(url.searchParams.get('limit'), 120)),
+    policy: runtime.settings.execution,
+  }),
 
   'GET /api/research/edge': () => ({
     regime: runtime.regime,
@@ -379,11 +381,13 @@ const routes: Record<string, Handler> = {
 
   'GET /api/operations': () => ({
     health: runtime.health(),
-    qualityEvents: runtime.store.listQualityEvents(100),
+    qualityEvents: runtime.store.listQualityEvents(60),
     lastBackup: runtime.store.getState('last_backup', null),
-    lastParquetExport: runtime.store.getState('last_parquet_export', null),
-    database: { path: runtime.store.path, bytes: (() => { try { return statSync(runtime.store.path).size } catch { return 0 } })() },
+    backups: listBackups().slice(0, 12).map((file) => ({ name: file.name, bytes: file.bytes, at: file.at })),
+    disk: diskUsage(),
+    database: { path: runtime.store.path, bytes: (() => { try { return statSync(runtime.store.path).size } catch { return 0 } })(), restoredFrom: runtime.store.restoredFrom },
     aiUsage: runtime.store.aiUsageThisMonth(),
+    demo: runtime.demo.health(),
   }),
 
   'POST /api/operations/export': async (req) => {

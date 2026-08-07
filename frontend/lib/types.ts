@@ -341,10 +341,34 @@ export interface EngineSettings {
     onlyWatchlist: boolean
     quietHoursStart: number
     quietHoursEnd: number
-    sendScanDigest: boolean
-    digestIntervalMin: number
+    signalCards: boolean
+    orderCards: boolean
+    evolutionEvents: boolean
+    dailyDigest: boolean
+    digestHourUtc: number
+    heartbeatHours: number
+  }
+  evolution: {
+    enabled: boolean
+    minNewSamples: number
+    minNicheSamples: number
+    populationSize: number
+    generations: number
+    minBrierSkill: number
+    placebo: boolean
+    canaryMinTrades: number
+    rollbackWindow: number
+    rollbackMaxDrawdownR: number
+    intervalMinutes: number
+  }
+  execution: {
+    okxDemoEnabled: boolean
+    maxConcurrentDemoOrders: number
+    demoSizeMultiplier: number
+    demoInstTypes: string[]
   }
   engineEnabled: boolean
+  savedAt?: number
 }
 
 export interface Health {
@@ -375,15 +399,49 @@ export interface Health {
     budgetBlocked: boolean
   }
   telegram: { configured: boolean; username: string; sent: number; failed: number; received: number; chats: number; muted: number; lastError: string }
-  convex: { configured: boolean; status: string; lastError: string; writes: number; reads: number }
-  localStore: Record<string, number>
+  storage: {
+    dataDir: string
+    backupDir: string
+    dbBytes: number
+    backupBytes: number
+    freeBytes: number | null
+    totalBytes: number | null
+    usedPct: number | null
+    restoredFrom: string | null
+    backups: number
+    tables: Record<string, number>
+  }
   paper: { total: number; closed: number; open: number; active: number; winRate: number | null; avgR: number | null; sumR: number; killSwitch: boolean }
-  research: { validationState: string; governor: { allowed: boolean; reasons: string[]; rssMb: number; load1: number; running: boolean }; champion: unknown }
+  evolution: {
+    validationState: 'VALIDATED' | 'NO_VALIDATED_MODEL'
+    samples: number
+    specialists: number
+    champions: number
+    events: number
+    attributions: number
+    exchangeOrders: number
+    nicheCount: number
+    championList: { displayName: string; nicheKey: string; generation: number; liveTrades: number; liveMeanR: number | null; brier: number | null }[]
+  }
+  demoExecution: {
+    configured: boolean
+    simulated: boolean
+    reason: string
+    equityUsd: number | null
+    availableUsdt: number | null
+    placed: number
+    filled: number
+    rejected: number
+    openOrders: number
+    lastError: string
+    parity: { orders: number; terminal: number; filled: number; rejected: number; fillRate: number | null; meanEntrySlippageBps: number | null; worstEntrySlippageBps: number | null }
+  }
   resources: { rssMb: number; freeMemoryMb: number; totalMemoryMb: number; load1: number }
-  counters: { evaluations: number; alerts: number; signals: number; errors: number; wsMessages: number }
+  counters: { evaluations: number; alerts: number; signals: number; errors: number; wsMessages: number; demoOrders: number }
   scanner: { at: number; scanned: number; running: boolean }
   account: { totalEquityUsd: number; availableUsdt: number; currencies: { ccy: string; eq: number; availBal: number }[] } | null
   okxKeys: boolean
+  settingsSavedAt: number
   analyses: number
 }
 

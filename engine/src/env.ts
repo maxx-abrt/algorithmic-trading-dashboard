@@ -30,6 +30,13 @@ export const ENV = {
   port: num(process.env.PORT, 8790),
   convexUrl: process.env.CONVEX_URL || process.env.NEXT_PUBLIC_CONVEX_URL || '',
   workerKey: process.env.WORKER_API_KEY || '',
+  /**
+   * Convex is an OPTIONAL, WRITE-ONLY mirror and is off unless explicitly enabled.
+   * It used to be read back every 10 seconds, which silently reverted every settings
+   * change the moment its schema validator rejected an unknown field. SQLite is the
+   * only source of truth now.
+   */
+  convexMirror: process.env.CONVEX_MIRROR === '1' || process.env.CONVEX_MIRROR === 'true',
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || '',
     model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
@@ -48,4 +55,4 @@ export const ENV = {
 }
 
 export const HAS_OKX_KEYS = Boolean(ENV.okx.key && ENV.okx.secret && ENV.okx.passphrase)
-export const HAS_CONVEX = Boolean(ENV.convexUrl && ENV.workerKey)
+export const HAS_CONVEX = Boolean(ENV.convexMirror && ENV.convexUrl && ENV.workerKey)

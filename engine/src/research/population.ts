@@ -531,6 +531,11 @@ export interface CommitteeMember {
   /** forward evidence measured on real closed trades, null when unproven */
   liveMeanR: number | null
   liveTrades: number
+  /**
+   * MoE gating trust: 1.0 for an exact niche match, lower for an adjacent expert
+   * that is only partially qualified to speak about this context.
+   */
+  trust?: number
 }
 
 export interface CommitteeVote {
@@ -564,7 +569,7 @@ export function memberWeight(member: CommitteeMember): number {
     member.liveMeanR == null || member.liveTrades < 5
       ? 0.7
       : Math.max(0.2, Math.min(1.6, 1 + member.liveMeanR / 1.5)) * Math.min(1, member.liveTrades / 30 + 0.5)
-  return skill * shrink * forward
+  return skill * shrink * forward * (member.trust ?? 1)
 }
 
 export function committeeVerdict(members: readonly CommitteeMember[], features: readonly number[], takeThreshold = 0.5): CommitteeVerdict | null {

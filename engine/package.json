@@ -7,11 +7,9 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch --clear-screen=false src/index.ts",
-    "poc": "tsx scripts/poc.ts",
-    "core:poc": "tsx scripts/core-poc.ts",
-    "poc:core": "tsx scripts/poc-core.ts",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "poc": "tsx scripts/poc-core.ts"
   },
   "dependencies": {
     "better-sqlite3": "11.10.0",
@@ -31,7 +29,7 @@
     "typescript": "5.7.3",
     "vitest": "3.2.4"
   },
-    "engines": {
+  "engines": {
     "node": ">=22.0.0 <23.0.0"
   }
 }

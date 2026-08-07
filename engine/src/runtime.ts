@@ -1,18 +1,22 @@
 /**
  * Runtime orchestrator — the 24/7 brain.
  *
- * Responsibilities
+ * Loop responsibilities
  *   • keep the OKX universe, tickers and candle memory hot (REST seed + WS live)
- *   • analyse the focus instrument continuously and the watchlist on rotation
- *   • scan the liquid universe for the best setups
- *   • ask Gemini only when a real setup passed every local gate
- *   • evaluate alert rules, push Telegram cards, journal and grade every idea
- *   • never place an order: this system decides, the human executes
+ *   • analyse the focus instrument continuously and rotate the watchlist
+ *   • scan the liquid SPOT + SWAP universe for the best setups
+ *   • route every actionable candidate to the qualified specialist committee
+ *   • arm it as a paper trade AND, when demo keys exist, as a real OKX demo order
+ *   • absorb every closed outcome as an immutable point-in-time training sample
+ *   • evolve new generations, promote on forward evidence, roll back on decay
+ *   • report to Telegram: orders, generations, heartbeat, daily digest
+ *
+ * SQLite is the single source of truth. Convex is an optional write-only mirror.
  */
 import { loadavg, freemem, totalmem } from 'node:os'
 import { ENV, HAS_OKX_KEYS } from './env.js'
 import { log } from './log.js'
-import { convex, type AlertRuleRow, type SignalRow, type WatchRow } from './convex/client.js'
+import { convex, type AlertRuleRow, type WatchRow } from './convex/client.js'
 import {
   fetchAccount,
   fetchDerivatives,
@@ -30,147 +34,41 @@ import { analyze, quickScore, type QuickScore } from './quant/engine.js'
 import { higherTimeframes, normalizeBar } from './quant/timeframes.js'
 import type { Analysis, Candle, DerivativesBlock, EngineSettings, InstrumentSpec } from './quant/types.js'
 import { DEFAULT_SETTINGS } from './quant/types.js'
-import { GeminiOrchestrator, type AiConfig } from './ai/gemini.js'
+import { GeminiOrchestrator } from './ai/gemini.js'
 import { TelegramBot } from './telegram/bot.js'
 import { alertCard, signalCard, statusCard, HELP } from './telegram/cards.js'
+import { digestCard, evolutionCard, heartbeatCard, orderCard } from './telegram/notify.js'
 import { evaluateRule, scopeMatches, type AlertCandidate } from './alerts/rules.js'
-import { gradeSignal, toSignalRecord } from './journal.js'
 import { DurableStore } from './store/durable.js'
+import { backupFileName, diskUsage, listBackups, pruneBackups } from './store/backup.js'
 import { evaluateStrategies, type StrategyCandidate } from './strategies/registry.js'
 import { createPaperPlan, processPaperBar, submitPaperPlan } from './paper/broker.js'
 import { assessPaperRisk, DEFAULT_RISK_POLICY } from './paper/risk.js'
+import { REASON_LABELS, hypothesisFromAttribution, type ReasonCode } from './paper/attribution.js'
 import type { PaperTrade } from './paper/types.js'
-import { ResearchLab, CAMPAIGN_CONFIGS } from './research/lab.js'
-import type { CampaignType } from './research/lab.js'
-import { ChampionService } from './research/champion.js'
-import { fetchMarketContext, getCachedMarketContext, type MarketContext } from './quant/market-context.js'
+import { ResearchLab, type CampaignType } from './research/lab.js'
+import { EvolutionService } from './research/evolution-service.js'
+import { Harvester } from './research/harvester.js'
+import { applyMask, nicheKey, type CommitteeVerdict } from './research/population.js'
+import { OkxDemoBroker } from './execution/okx-demo.js'
+import { applySettingsPatch, DEFAULT_RUNTIME_SETTINGS, hydrateSettings, type Settings } from './settings/schema.js'
+import { fetchMarketContext, type MarketContext } from './quant/market-context.js'
 import { buildFeatureVector, FEATURE_ORDER } from './research/features.js'
-import { getCrossAssetData, getCachedCrossAssetData, type CrossAssetData } from './quant/cross-asset.js'
-import { getOnChainData, getCachedOnChainData, type OnChainData } from './quant/onchain.js'
+import { getCrossAssetData, type CrossAssetData } from './quant/cross-asset.js'
+import { getOnChainData, type OnChainData } from './quant/onchain.js'
 import { fetchOrderBook, type OrderBookSnapshot } from './quant/orderbook.js'
 import { forecastVolatility, type VolForecast } from './quant/vol-forecast.js'
 import { RegimeDetector, type RegimeInfo } from './quant/regime.js'
 import { fitAnomalyModel, detectAnomaly, type AnomalyModel, type AnomalyResult } from './quant/anomaly.js'
 import { computeKellySize, estimateUncertainty, type KellyResult } from './quant/kelly.js'
 import { explainPrediction, type ExplanationResult } from './research/explain.js'
-import { bmaSizeMultiplier, type BMAResult } from './research/bma.js'
-import { createMetaPlaybookModel, recordPlaybookOutcome, adjustPlaybooksForRegime, serializeMetaPlaybook, deserializeMetaPlaybook, type MetaPlaybookModel } from './research/meta-playbook.js'
+import { createMetaPlaybookModel, recordPlaybookOutcome, serializeMetaPlaybook, deserializeMetaPlaybook, type MetaPlaybookModel } from './research/meta-playbook.js'
 import { fmtPct, fmtPrice, fmtUsd } from './format.js'
 
-/* -------------------------------------------------------------------------- */
-/*  Settings shape (mirrors the Convex document)                               */
-/* -------------------------------------------------------------------------- */
-
-export interface RuntimeSettings {
-  instId: string
-  timeframe: string
-  htfTimeframe: string
-  htf2Timeframe: string
-  strategy: string
-  minConfidence: number
-  minCompositeScore: number
-  requireMtfAlignment: boolean
-  usePatterns: boolean
-  useDerivatives: boolean
-  useEmpiricalEdge: boolean
-  maxAtrPct: number
-  minAdx: number
-  weights: Record<string, number>
-  riskPerTradePct: number
-  leverage: number
-  rrRatio: number
-  equityUsd: number
-  useAccountBalance: boolean
-  takerFeeBps: number
-  maxOpenPositions: number
-  maxDailyLossPct: number
-  maxOpenRiskPct: number
-  maxGrossExposurePct: number
-  aiMonthlyBudgetEur: number
-  autoResearchEnabled: boolean
-  researchIntervalHours: number
-  ai: AiConfig
-  scanner: {
-    enabled: boolean
-    timeframe: string
-    instTypes: string[]
-    quoteCcy: string
-    minVol24hUsd: number
-    universeSize: number
-    intervalMs: number
-    includeEquities: boolean
-  }
-  telegram: {
-    enabled: boolean
-    minConviction: number
-    onlyWatchlist: boolean
-    quietHoursStart: number
-    quietHoursEnd: number
-    sendScanDigest: boolean
-    digestIntervalMin: number
-  }
-  engineEnabled: boolean
-}
-
-export const FALLBACK_SETTINGS: RuntimeSettings = {
-  instId: 'BTC-USDT-SWAP',
-  timeframe: '15m',
-  htfTimeframe: '1H',
-  htf2Timeframe: '4H',
-  strategy: 'adaptive',
-  minConfidence: 60,
-  minCompositeScore: 20,
-  requireMtfAlignment: true,
-  usePatterns: true,
-  useDerivatives: true,
-  useEmpiricalEdge: true,
-  maxAtrPct: 8,
-  minAdx: 16,
-  weights: { trend: 1, momentum: 1, volatility: 1, volume: 1, structure: 1, pattern: 1, derivatives: 1, mtf: 1, stats: 1, edge: 1 },
-  riskPerTradePct: 1,
-  leverage: 5,
-  rrRatio: 2,
-  equityUsd: ENV.defaultEquityUsd,
-  useAccountBalance: false,
-  takerFeeBps: 5,
-  maxOpenPositions: 3,
-  maxDailyLossPct: 4,
-  maxOpenRiskPct: 3,
-  maxGrossExposurePct: 150,
-  aiMonthlyBudgetEur: 10,
-  autoResearchEnabled: true,
-  researchIntervalHours: 24,
-  ai: {
-    enabled: true,
-    model: ENV.gemini.model,
-    temperature: 0.15,
-    maxOutputTokens: 1200,
-    thinkingBudget: 0,
-    cooldownMs: 90_000,
-    minConvictionToAsk: 45,
-    contextDepth: 'standard',
-  },
-  scanner: {
-    enabled: true,
-    timeframe: '15m',
-    instTypes: ['SWAP', 'SPOT'],
-    quoteCcy: 'USDT',
-    minVol24hUsd: 5_000_000,
-    universeSize: 60,
-    intervalMs: 60_000,
-    includeEquities: true,
-  },
-  telegram: {
-    enabled: true,
-    minConviction: 62,
-    onlyWatchlist: false,
-    quietHoursStart: 0,
-    quietHoursEnd: 0,
-    sendScanDigest: false,
-    digestIntervalMin: 240,
-  },
-  engineEnabled: true,
-}
+export type RuntimeSettings = Settings
+export const FALLBACK_SETTINGS = DEFAULT_RUNTIME_SETTINGS
+const FEATURE_SCHEMA = `features_v2_${FEATURE_ORDER.length}`
+const POLICY_VERSION = 'explicit-playbooks-v2'
 
 /* -------------------------------------------------------------------------- */
 /*  Helpers                                                                    */
@@ -226,7 +124,8 @@ export interface ScanRow extends QuickScore {
 /* -------------------------------------------------------------------------- */
 
 export class Runtime {
-  settings: RuntimeSettings = { ...FALLBACK_SETTINGS }
+  settings: Settings = { ...DEFAULT_RUNTIME_SETTINGS }
+  settingsSavedAt = 0
   universe = new Map<string, InstrumentSpec>()
   tickers = new Map<string, Ticker>()
   watchlist: WatchRow[] = []
@@ -239,12 +138,15 @@ export class Runtime {
   mutedChats = new Set<number>()
   startedAt = Date.now()
   store = new DurableStore()
-  champion!: ChampionService
-  research!: ResearchLab
+  evolution: EvolutionService
+  demo: OkxDemoBroker
+  research: ResearchLab
+  harvester: Harvester
   paperTrades = new Map<string, PaperTrade>()
   paperKillSwitch = this.store.getState<boolean>('paper_kill_switch', false)
   latestCandidates = new Map<string, StrategyCandidate[]>()
-  counters = { evaluations: 0, alerts: 0, signals: 0, errors: 0, wsMessages: 0 }
+  latestVerdicts = new Map<string, CommitteeVerdict>()
+  counters = { evaluations: 0, alerts: 0, signals: 0, errors: 0, wsMessages: 0, demoOrders: 0 }
   lastAlertAt = new Map<string, number>()
   private derivCache = new Map<string, { at: number; data: DerivativesBlock }>()
   private aiCooldown = new Map<string, number>()
@@ -257,7 +159,7 @@ export class Runtime {
   marketContext: MarketContext | null = null
   crossAsset: CrossAssetData | null = null
   onChain: OnChainData | null = null
-  orderBook: Map<string, OrderBookSnapshot> = new Map()
+  orderBook = new Map<string, OrderBookSnapshot>()
   volForecast: VolForecast | null = null
   regime: RegimeInfo | null = null
   regimeDetector = new RegimeDetector()
@@ -265,16 +167,22 @@ export class Runtime {
   anomalyResult: AnomalyResult | null = null
   kellyResult: KellyResult | null = null
   explanation: ExplanationResult | null = null
-  bmaResult: BMAResult | null = null
   metaPlaybook: MetaPlaybookModel = createMetaPlaybookModel()
 
   constructor() {
     candleStore.attachDurableStore(this.store)
-    this.champion = new ChampionService(this.store)
-    this.research = new ResearchLab(this.store, this.champion)
+    this.evolution = new EvolutionService(this.store)
+    this.demo = new OkxDemoBroker(this.evolution.store)
+    this.research = new ResearchLab(this.store, (sample) => this.evolution.recordBackfillSample(sample))
+    this.harvester = new Harvester(this.store, this.evolution)
     for (const trade of this.store.loadActiveTrades()) this.paperTrades.set(trade.id, trade)
     this.gemini = new GeminiOrchestrator(ENV.gemini.apiKey)
     this.bot = new TelegramBot(ENV.telegram.token)
+    this.evolution.onNotice = (notice) => {
+      if (!this.settings.telegram.enabled || !this.settings.telegram.evolutionEvents) return
+      if (notice.type === 'rejected') return
+      void this.bot.broadcast(this.activeChats(), evolutionCard(notice))
+    }
     this.stream = new OkxStream({
       onCandle: (instId, bar, candle) => {
         this.counters.wsMessages++
@@ -298,14 +206,19 @@ export class Runtime {
   /* ---- lifecycle ------------------------------------------------------- */
 
   async boot() {
-    log.info('boot', `APEX-02 engine starting · OKX keys ${HAS_OKX_KEYS ? 'present (read-only)' : 'absent (public data)'}`)
-    await this.refreshSettings()
+    log.info('boot', `MYCROFT engine starting · OKX ${HAS_OKX_KEYS ? (ENV.okx.simulated ? 'DEMO keys present' : 'LIVE keys present — demo execution disabled') : 'public data only'}`)
+    if (this.store.restoredFrom) log.info('boot', `database was missing and has been restored from ${this.store.restoredFrom}`)
+    this.loadLocalState()
     await this.refreshUniverse()
     await this.refreshTickers()
-    await this.seedDefaults()
-    this.champion.loadFromStore()
-    this.champion.loadCanaryFromStore()
+    this.seedDefaults()
     this.loadMetaPlaybook()
+    if (this.demo.configured) {
+      const balance = await this.demo.refreshBalance()
+      log.info('okx-demo', balance ? `demo account ready · equity ${fmtUsd(balance.equityUsd)} · ${fmtUsd(balance.availableUsdt)} USDT free` : `demo balance unavailable: ${this.demo.health().lastError}`)
+    } else {
+      log.info('okx-demo', `real demo execution disabled — ${this.demo.blockReason}`)
+    }
     this.stream.connect()
     this.syncSubscriptions()
 
@@ -316,24 +229,21 @@ export class Runtime {
       log.info('telegram', `bot @${this.bot.me?.username ?? '?'} online`)
       if (ENV.telegram.chatId) {
         const id = Number(ENV.telegram.chatId)
-        if (Number.isFinite(id)) {
-          this.chats = [...new Set([...this.chats, id])]
-          await convex.registerChat(id)
-        }
+        if (Number.isFinite(id)) this.registerChat(id)
       }
     }
 
-    every(10_000, () => this.refreshSettings(), 'settings')
     every(6_000, () => this.refreshTickers(), 'tickers')
     every(10 * 60_000, () => this.refreshUniverse(), 'universe')
     every(4_000, () => this.focusLoop(), 'focus')
     every(5_000, () => this.watchLoop(), 'watch')
     every(15_000, () => this.scanLoop(), 'scanner')
-    every(20_000, () => this.journalLoop(), 'journal-mirror')
     every(10_000, () => this.paperLoop(), 'paper-broker')
+    every(20_000, () => this.demoLoop(), 'okx-demo')
     every(10 * 60_000, () => this.maintenanceLoop(), 'maintenance')
+    every(5 * 60_000, () => this.evolutionLoop(), 'evolution')
     every(30 * 60_000, () => this.autoResearchLoop(), 'auto-research')
-    every(10 * 60_000, () => this.championLoop(), 'champion-lifecycle')
+    every(6 * 60 * 60_000, () => this.backupLoop(), 'backup')
     every(15 * 60_000, () => this.refreshMarketContext(), 'market-context')
     every(15 * 60_000, () => this.refreshCrossAsset(), 'cross-asset')
     every(30 * 60_000, () => this.refreshOnChain(), 'on-chain')
@@ -341,114 +251,123 @@ export class Runtime {
     every(60_000, () => this.refreshVolForecast(), 'vol-forecast')
     every(30_000, () => this.refreshRegime(), 'regime-detect')
     every(30 * 60_000, () => this.saveMetaPlaybook(), 'meta-playbook')
+    every(60_000, () => this.reportLoop(), 'telegram-reports')
     every(30_000, () => this.telemetryLoop(), 'telemetry')
     every(5_000, () => log.flush(), 'logflush')
     every(60_000, () => this.refreshAccount(), 'account')
+    every(60 * 60_000, () => this.harvestLoop(), 'harvest')
     log.info('boot', 'all loops armed')
   }
 
-  /* ---- configuration --------------------------------------------------- */
+  /* ---- configuration (SQLite only) ------------------------------------- */
 
-  async refreshSettings() {
-    const local = this.store.getState<Partial<RuntimeSettings>>('settings', {})
-    const remote = convex.configured ? ((await convex.getSettings()) as Partial<RuntimeSettings> | null) : null
-    const row = remote ?? local
-    this.settings = {
-      ...FALLBACK_SETTINGS,
-      ...row,
-      weights: { ...FALLBACK_SETTINGS.weights, ...(row.weights ?? {}) },
-      ai: { ...FALLBACK_SETTINGS.ai, ...(row.ai ?? {}) },
-      scanner: { ...FALLBACK_SETTINGS.scanner, ...(row.scanner ?? {}) },
-      telegram: { ...FALLBACK_SETTINGS.telegram, ...(row.telegram ?? {}) },
-    }
+  private loadLocalState() {
+    this.settings = hydrateSettings(this.store.getState<unknown>('settings', {}))
+    this.settingsSavedAt = this.store.getState<number>('settings_saved_at', 0)
     if (this.settings.htfTimeframe === 'auto' || this.settings.htf2Timeframe === 'auto') {
       const [h1, h2] = higherTimeframes(this.settings.timeframe)
-      if (this.settings.htfTimeframe === 'auto') this.settings.htfTimeframe = h1
-      if (this.settings.htf2Timeframe === 'auto') this.settings.htf2Timeframe = h2
+      if (this.settings.htfTimeframe === 'auto') this.settings.htfTimeframe = h1 as Settings['htfTimeframe']
+      if (this.settings.htf2Timeframe === 'auto') this.settings.htf2Timeframe = h2 as Settings['htf2Timeframe']
     }
-    const [remoteWatch, remoteRules, chats] = convex.configured
-      ? await Promise.all([convex.listWatchlist(), convex.listRules(), convex.listChats()])
-      : [null, null, null]
-    this.watchlist = (remoteWatch ?? this.store.getState<WatchRow[]>('watchlist', [])).filter((row) => row.enabled)
-    this.rules = remoteRules ?? this.store.getState<AlertRuleRow[]>('alert_rules', [])
-    if (chats) {
-      this.chats = chats.map((c) => c.chatId)
-      this.mutedChats = new Set(chats.filter((c) => c.muted).map((c) => c.chatId))
-    }
+    this.watchlist = this.store.getState<WatchRow[]>('watchlist', []).filter((row) => row.enabled)
+    this.rules = this.store.getState<AlertRuleRow[]>('alert_rules', [])
+    const chats = this.store.getState<{ chatId: number; muted?: boolean }[]>('telegram_chats', [])
+    this.chats = chats.map((chat) => chat.chatId)
+    this.mutedChats = new Set(chats.filter((chat) => chat.muted).map((chat) => chat.chatId))
   }
 
-  async updateSettings(patch: Record<string, unknown>) {
-    this.settings = {
-      ...this.settings,
-      ...patch,
-      weights: { ...this.settings.weights, ...((patch.weights as Record<string, number> | undefined) ?? {}) },
-      ai: { ...this.settings.ai, ...((patch.ai as Partial<AiConfig> | undefined) ?? {}) },
-      scanner: { ...this.settings.scanner, ...((patch.scanner as Partial<RuntimeSettings['scanner']> | undefined) ?? {}) },
-      telegram: { ...this.settings.telegram, ...((patch.telegram as Partial<RuntimeSettings['telegram']> | undefined) ?? {}) },
+  /** Validate first, persist second, read back third. A rejected patch changes nothing. */
+  updateSettings(patch: Record<string, unknown>) {
+    const result = applySettingsPatch(this.settings, patch)
+    if (!result.ok) {
+      log.error('settings', `rejected patch: ${result.errors.join('; ')}`)
+      return { ok: false as const, errors: result.errors, settings: this.settings, savedAt: this.settingsSavedAt }
     }
+    this.settings = result.settings
+    this.settingsSavedAt = Date.now()
     this.store.setState('settings', this.settings)
-    if (convex.configured) await convex.updateSettings(patch)
+    this.store.setState('settings_saved_at', this.settingsSavedAt)
+    const persisted = hydrateSettings(this.store.getState<unknown>('settings', {}))
+    this.settings = persisted
     this.syncSubscriptions()
-    return this.settings
+    log.info('settings', `saved: ${result.changed.join(', ') || 'no-op'}`)
+    if (ENV.convexMirror) void convex.updateSettings(patch)
+    return { ok: true as const, errors: [] as string[], settings: persisted, savedAt: this.settingsSavedAt }
   }
 
-  /** First-run experience: a liquid crypto research universe and sane alert rules. */
-  private async seedDefaults() {
+  private seedDefaults() {
     if (!this.watchlist.length) {
-      const seed = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT', 'DOGE-USDT', 'ADA-USDT', 'AVAX-USDT', 'LINK-USDT']
+      const seed = ['BTC-USDT-SWAP', 'ETH-USDT-SWAP', 'SOL-USDT-SWAP', 'BTC-USDT', 'ETH-USDT', 'SOL-USDT', 'XRP-USDT', 'DOGE-USDT', 'AVAX-USDT', 'LINK-USDT']
       for (const instId of seed) {
         const spec = this.universe.get(instId)
         if (!spec) continue
-        await this.addWatch(instId, spec.instType, this.settings.timeframe, 'liquidity-ranked default universe')
+        this.addWatch(instId, spec.instType, this.settings.timeframe, 'default liquidity-ranked universe')
       }
-      log.info('boot', `seeded research watchlist with ${this.watchlist.length} instruments`)
+      log.info('boot', `seeded watchlist with ${this.watchlist.length} instruments across SPOT and SWAP`)
     }
     if (!this.rules.length) {
-      await this.upsertAlertRule({
-        name: 'Evidence-backed paper candidate', scope: '*', type: 'signal', timeframe: 'any',
-        params: { threshold: 65, direction: 'any' }, cooldownMs: 30 * 60_000,
-        telegram: false, enabled: true,
+      this.upsertAlertRule({
+        name: 'Evidence-backed paper candidate',
+        scope: '*',
+        type: 'signal',
+        timeframe: 'any',
+        params: { threshold: 62, direction: 'any' },
+        cooldownMs: 30 * 60_000,
+        telegram: true,
+        enabled: true,
       })
-      log.info('boot', 'seeded local alert rule')
     }
   }
 
-  async addWatch(instId: string, instType: string, timeframe: string, note?: string) {
+  addWatch(instId: string, instType: string, timeframe: string, note?: string) {
     const existing = this.watchlist.find((row) => row.instId === instId)
     if (existing) Object.assign(existing, { instType, timeframe, note, enabled: true })
     else this.watchlist.push({ _id: `local:${instId}`, instId, instType, timeframe, enabled: true, alertsEnabled: true, note, addedAt: Date.now() })
     this.store.setState('watchlist', this.watchlist)
-    if (convex.configured) await convex.addWatch(instId, instType, timeframe, note)
   }
 
-  async removeWatch(instId: string) {
+  removeWatch(instId: string) {
     this.watchlist = this.watchlist.filter((row) => row.instId !== instId)
     this.store.setState('watchlist', this.watchlist)
-    if (convex.configured) await convex.removeWatch(instId)
   }
 
-  async patchWatch(instId: string, patch: Partial<WatchRow>) {
+  patchWatch(instId: string, patch: Partial<WatchRow>) {
     const row = this.watchlist.find((item) => item.instId === instId)
     if (row) Object.assign(row, patch)
     this.store.setState('watchlist', this.watchlist)
-    if (convex.configured) await convex.patchWatch(instId, patch)
   }
 
-  async upsertAlertRule(rule: Omit<AlertRuleRow, '_id' | 'lastFiredAt' | 'firedCount' | 'createdAt'> & { id?: string }) {
+  upsertAlertRule(rule: Omit<AlertRuleRow, '_id' | 'lastFiredAt' | 'firedCount' | 'createdAt'> & { id?: string }) {
     const id = rule.id ?? `local:${Date.now()}:${Math.random().toString(36).slice(2)}`
     const existing = this.rules.find((item) => item._id === id)
     const row: AlertRuleRow = { ...rule, _id: id, lastFiredAt: existing?.lastFiredAt ?? 0, firedCount: existing?.firedCount ?? 0, createdAt: existing?.createdAt ?? Date.now() }
     delete (row as AlertRuleRow & { id?: string }).id
     this.rules = [...this.rules.filter((item) => item._id !== id), row]
     this.store.setState('alert_rules', this.rules)
-    if (convex.configured) await convex.upsertRule({ ...rule, id })
     return id
   }
 
-  async deleteAlertRule(id: string) {
+  deleteAlertRule(id: string) {
     this.rules = this.rules.filter((rule) => rule._id !== id)
     this.store.setState('alert_rules', this.rules)
-    if (convex.configured) await convex.deleteRule(id)
+  }
+
+  registerChat(chatId: number, firstName?: string, username?: string) {
+    const chats = this.store.getState<{ chatId: number; muted?: boolean; firstName?: string; username?: string }[]>('telegram_chats', [])
+    const next = [...chats.filter((chat) => chat.chatId !== chatId), { chatId, muted: false, firstName, username }]
+    this.store.setState('telegram_chats', next)
+    this.chats = next.map((chat) => chat.chatId)
+    this.mutedChats.delete(chatId)
+  }
+
+  setChatMuted(chatId: number, muted: boolean) {
+    const chats = this.store.getState<{ chatId: number; muted?: boolean }[]>('telegram_chats', [])
+    this.store.setState(
+      'telegram_chats',
+      chats.map((chat) => (chat.chatId === chatId ? { ...chat, muted } : chat)),
+    )
+    if (muted) this.mutedChats.add(chatId)
+    else this.mutedChats.delete(chatId)
   }
 
   /* ---- market data ----------------------------------------------------- */
@@ -506,46 +425,51 @@ export class Runtime {
   async refreshOrderBook() {
     if (!this.settings.engineEnabled) return
     try {
-      const instId = this.settings.instId
-      const snapshot = await fetchOrderBook(instId)
-      if (snapshot) this.orderBook.set(instId, snapshot)
-    } catch { /* graceful */ }
+      const snapshot = await fetchOrderBook(this.settings.instId)
+      if (snapshot) this.orderBook.set(this.settings.instId, snapshot)
+    } catch {
+      /* graceful */
+    }
   }
 
   refreshVolForecast() {
     try {
-      const instId = this.settings.instId
-      const candles = candleStore.peek(instId, this.settings.timeframe)
+      const candles = candleStore.peek(this.settings.instId, this.settings.timeframe)
       if (!candles || candles.length < 30) return
       const returns = candles.slice(-100).map((c: Candle) => (c.close - c.open) / c.open)
-      const atrPct = this.analyses.get(this.settings.instId)?.indicators?.volatility?.atrPct
+      const atrPct = this.analyses.get(this.key(this.settings.instId, this.settings.timeframe))?.indicators?.volatility?.atrPct
       this.volForecast = forecastVolatility(returns, { atrPct })
-    } catch { /* graceful */ }
+    } catch {
+      /* graceful */
+    }
   }
 
   refreshRegime() {
     try {
-      const instId = this.settings.instId
-      const analysis = this.analyses.get(instId)
+      const analysis = this.analyses.get(this.key(this.settings.instId, this.settings.timeframe))
       if (!analysis?.indicators) return
       const i = analysis.indicators
       const features = {
         atrPct: i.volatility.atrPct,
         adx: i.trend.adx,
         rsi: i.momentum.rsi,
-        return20: (i.price - i.ma.ema21) / i.ma.ema21 * 100,
+        return20: ((i.price - i.ma.ema21) / i.ma.ema21) * 100,
         volumeRatio: i.volume.volumeRatio,
         hurst: i.stats.hurst,
       }
       this.regimeDetector.update(features)
       this.regime = this.regimeDetector.classify(features)
-    } catch { /* graceful */ }
+    } catch {
+      /* graceful */
+    }
   }
 
   saveMetaPlaybook() {
     try {
       this.store.setState('meta_playbook', serializeMetaPlaybook(this.metaPlaybook))
-    } catch { /* graceful */ }
+    } catch {
+      /* graceful */
+    }
   }
 
   loadMetaPlaybook() {
@@ -555,7 +479,9 @@ export class Runtime {
         const model = deserializeMetaPlaybook(json)
         if (model) this.metaPlaybook = model
       }
-    } catch { /* graceful */ }
+    } catch {
+      /* graceful */
+    }
   }
 
   async refreshAccount() {
@@ -573,14 +499,11 @@ export class Runtime {
 
   private async derivatives(instId: string, instType: string): Promise<DerivativesBlock | null> {
     if (!this.settings.useDerivatives) return null
+    if (instType === 'SPOT') return null
     const cached = this.derivCache.get(instId)
     if (cached && Date.now() - cached.at < 60_000) return cached.data
     try {
-      const data = await fetchDerivatives(
-        instId,
-        (instType as InstType) ?? 'SWAP',
-        this.tickers.get(instId)?.changePct24h ?? null,
-      )
+      const data = await fetchDerivatives(instId, (instType as InstType) ?? 'SWAP', this.tickers.get(instId)?.changePct24h ?? null)
       this.derivCache.set(instId, { at: Date.now(), data })
       return data
     } catch (err) {
@@ -595,10 +518,7 @@ export class Runtime {
     this.stream.syncTickers(instruments.slice(0, 60))
     const pairs = instruments.slice(0, 12).map((instId) => ({
       instId,
-      bars:
-        instId === focus
-          ? [this.settings.timeframe, this.settings.htfTimeframe]
-          : [this.watchlist.find((w) => w.instId === instId)?.timeframe ?? this.settings.timeframe],
+      bars: instId === focus ? [this.settings.timeframe, this.settings.htfTimeframe] : [this.watchlist.find((w) => w.instId === instId)?.timeframe ?? this.settings.timeframe],
     }))
     this.stream.syncCandles(pairs)
   }
@@ -639,10 +559,10 @@ export class Runtime {
     return `${instId}|${normalizeBar(timeframe)}`
   }
 
-  /** Count consecutive losing paper trades for an instrument. */
   private consecutiveLosses(instId: string): number {
-    const trades = this.store.listTrades(50, 'closed')
-      .filter((t) => t.plan.instId === instId && t.netRealizedR != null)
+    const trades = this.store
+      .listTrades(50, 'closed')
+      .filter((t) => t.plan.instId === instId)
       .sort((a, b) => (b.closedAt ?? 0) - (a.closedAt ?? 0))
     let count = 0
     for (const t of trades) {
@@ -652,12 +572,11 @@ export class Runtime {
     return count
   }
 
-  /** Current drawdown in R for an instrument. */
   private currentDrawdownR(instId: string): number {
-    const trades = this.store.listTrades(100, 'closed')
-      .filter((t) => t.plan.instId === instId && t.netRealizedR != null)
+    const trades = this.store
+      .listTrades(100, 'closed')
+      .filter((t) => t.plan.instId === instId)
       .sort((a, b) => (a.closedAt ?? 0) - (b.closedAt ?? 0))
-    if (trades.length === 0) return 0
     let peak = 0
     let cumulative = 0
     let maxDD = 0
@@ -669,25 +588,32 @@ export class Runtime {
     return maxDD
   }
 
-  /**
-   * Full pipeline for one instrument: warm candles for three timeframes, pull
-   * the derivatives context, run the quant brain, optionally ask the LLM, then
-   * fire alerts and journal the idea.
-   */
-  async analyzeInstrument(
-    instIdRaw: string,
-    timeframeRaw?: string,
-    opts: { withAi?: boolean; silent?: boolean } = {},
-  ): Promise<Analysis | null> {
+  featureSnapshot(analysis: Analysis, playbookScore: number) {
+    return buildFeatureVector({
+      compositeScore: analysis.compositeScore,
+      mtfAlignment: analysis.mtfAlignment,
+      indicators: analysis.indicators,
+      playbookScore,
+      marketContext: analysis.marketContext,
+      derivatives: analysis.derivatives,
+      crossAsset: this.crossAsset,
+      onChain: this.onChain,
+      orderBook: this.orderBook.get(analysis.instId) ?? null,
+      volForecast: this.volForecast,
+      regime: this.regime,
+    })
+  }
+
+  async analyzeInstrument(instIdRaw: string, timeframeRaw?: string, opts: { withAi?: boolean; silent?: boolean } = {}): Promise<Analysis | null> {
     const instId = this.resolveInstId(instIdRaw)
     if (!instId) return null
     const spec = this.universe.get(instId) ?? null
+    const instType = spec?.instType ?? 'SWAP'
     const timeframe = normalizeBar(timeframeRaw ?? this.settings.timeframe)
     const [htf, htf2] = (() => {
       const auto = higherTimeframes(timeframe)
       const a = normalizeBar(this.settings.htfTimeframe)
       const b = normalizeBar(this.settings.htf2Timeframe)
-      // Never let the "higher" timeframe be lower than the entry timeframe.
       return [a === timeframe ? auto[0] : a, b === timeframe || b === a ? auto[1] : b]
     })()
 
@@ -698,11 +624,11 @@ export class Runtime {
     ])
 
     const ticker = this.tickers.get(instId) ?? null
-    const deriv = await this.derivatives(instId, spec?.instType ?? 'SWAP')
+    const deriv = await this.derivatives(instId, instType)
 
     const analysis = analyze({
       instId,
-      instType: spec?.instType,
+      instType,
       spec,
       ltf: ltfC,
       htf: htfC,
@@ -712,7 +638,7 @@ export class Runtime {
       livePrice: ticker?.last ?? null,
       volUsd24h: ticker?.volUsd24h ?? null,
       availableUsd: this.account?.availableUsdt ?? null,
-      championModel: this.champion.model,
+      championModel: null,
       marketContext: this.marketContext,
       crossAsset: this.crossAsset,
       onChain: this.onChain,
@@ -726,102 +652,103 @@ export class Runtime {
     const prev = this.analyses.get(k) ?? null
     if (prev) this.previous.set(k, prev)
 
-    /* ---- Cutting-edge: anomaly detection, Kelly sizing, explainability ---- */
-    if (analysis.decision !== 'WAIT' && this.champion.anomalyModel) {
-      const candidates = evaluateStrategies(analysis)
-      const selected = candidates.find((c) => c.eligible && c.side === (analysis.decision === 'WAIT' ? analysis.bias === 'BULLISH' ? 'LONG' : 'SHORT' : analysis.decision))
-      const features = buildFeatureVector({
-        compositeScore: analysis.compositeScore,
-        mtfAlignment: analysis.mtfAlignment,
-        indicators: analysis.indicators,
-        playbookScore: selected?.score ?? 0,
-        marketContext: analysis.marketContext,
-        derivatives: analysis.derivatives,
-        crossAsset: this.crossAsset,
-        onChain: this.onChain,
-        orderBook: this.orderBook.get(instId) ?? null,
-        volForecast: this.volForecast,
-        regime: this.regime,
-      })
-      // Anomaly detection: veto trades in unknown market conditions
-      const anomaly = detectAnomaly(this.champion.anomalyModel, features)
-      this.anomalyResult = anomaly
-      if (anomaly.action === 'skip') {
-        analysis.vetoes.push({ id: 'anomaly_skip', reason: `anomaly: ${anomaly.reason}`, severity: 'hard' })
-        analysis.decision = 'WAIT'
-        log.info('anomaly', `${instId} trade skipped: ${anomaly.reason}`)
-      } else if (anomaly.action === 'reduce') {
-        analysis.vetoes.push({ id: 'anomaly_reduce', reason: `anomaly: ${anomaly.reason}`, severity: 'soft' })
-        log.info('anomaly', `${instId} trade caution: ${anomaly.reason}`)
-      }
-      // Explainability: generate feature contribution breakdown
-      if (this.champion.model) {
-        try {
-          this.explanation = explainPrediction(this.champion.model, features, [...FEATURE_ORDER] as string[])
-        } catch { /* feature count mismatch on first run */ }
-      }
-      // BMA: Bayesian Model Averaging across champion + retired models
-      const bma = this.champion.bmaPredict(features)
-      this.bmaResult = bma
-      if (bma) {
-        if (bma.consensus === 'skip') {
-          analysis.vetoes.push({ id: 'bma_skip', reason: `BMA: models disagree (${bma.agreement}/${bma.totalModels} agree)`, severity: 'hard' })
+    const candidates = evaluateStrategies(analysis)
+    this.latestCandidates.set(k, candidates)
+    const selected =
+      candidates.find((candidate) => candidate.eligible && candidate.side === analysis.decision) ??
+      candidates.find((candidate) => candidate.side === (analysis.plan ?? analysis.shadowPlan)?.side) ??
+      candidates[0]
+
+    /* ---- mixture of experts: only qualified specialists get a vote ------ */
+    if (selected && analysis.decision !== 'WAIT') {
+      const features = this.featureSnapshot(analysis, selected.score)
+      const verdict = this.evolution.verdict({ playbook: selected.playbook, instType, timeframe }, features)
+      if (verdict) {
+        this.latestVerdicts.set(k, verdict)
+        const exactExpert = verdict.members.some((member) => member.trust === 1)
+        if (analysis.plan) {
+          const costR = analysis.plan.expectancyR - analysis.plan.netExpectancyR
+          const trust = Math.min(0.75, verdict.confidence * (exactExpert ? 0.75 : 0.4))
+          const blended = analysis.plan.winProbability * (1 - trust) + verdict.probability * trust
+          analysis.plan.winProbability = blended
+          analysis.plan.probabilityBasis = 'champion_calibrated_blend'
+          analysis.plan.expectancyR = blended * analysis.plan.expectedRr - (1 - blended)
+          analysis.plan.netExpectancyR = blended * (analysis.plan.expectedRr - costR) - (1 - blended) * (1 + costR)
+        }
+        // Only an EXACT-niche expert may veto. Adjacent experts can shrink size but
+        // never silence a niche they were not trained on — the system must keep
+        // generating evidence for niches it has not learned yet.
+        if (verdict.consensus === 'skip' && exactExpert) {
+          analysis.vetoes.push({
+            id: 'committee_skip',
+            reason: `specialist committee skip · p=${(verdict.probability * 100).toFixed(0)}% · ${verdict.agreement}/${verdict.totalMembers} agree`,
+            severity: 'hard',
+          })
           analysis.decision = 'WAIT'
-          log.info('bma', `${instId} trade skipped: models disagree (${bma.agreement}/${bma.totalModels})`)
-        } else if (analysis.plan) {
-          // Override win probability with BMA weighted prediction
-          analysis.plan.winProbability = bma.prediction
-          log.info('bma', `${instId} consensus=${bma.consensus} pred=${bma.prediction.toFixed(3)} conf=${bma.confidence.toFixed(2)} agree=${bma.agreement}/${bma.totalModels}`)
+        }
+        analysis.narrative.push(
+          `── Specialist committee (${verdict.totalMembers} expert${verdict.totalMembers === 1 ? '' : 's'}) ──`,
+          `${verdict.consensus.toUpperCase()} · p=${(verdict.probability * 100).toFixed(1)}% · confidence ${(verdict.confidence * 100).toFixed(0)}% · size ×${verdict.sizeMultiplier.toFixed(2)}`,
+          ...verdict.votes.slice(0, 4).map((vote) => `  • ${vote.displayName} G${vote.generation} → ${(vote.probability * 100).toFixed(0)}% (weight ${vote.weight.toFixed(2)})`),
+        )
+        const primary = verdict.members.find((member) => member.trust === 1) ?? verdict.members[0]
+        if (primary) {
+          try {
+            this.explanation = explainPrediction(primary.artifact.model, applyMask(features, primary.artifact.featureMask), [...FEATURE_ORDER])
+          } catch {
+            /* feature schema mismatch */
+          }
+        }
+      } else {
+        this.latestVerdicts.delete(k)
+      }
+
+      if (this.anomalyModel) {
+        const anomaly = detectAnomaly(this.anomalyModel, features)
+        this.anomalyResult = anomaly
+        if (anomaly.action === 'skip') {
+          analysis.vetoes.push({ id: 'anomaly_skip', reason: `unseen market conditions: ${anomaly.reason}`, severity: 'hard' })
+          analysis.decision = 'WAIT'
+        } else if (anomaly.action === 'reduce') {
+          analysis.vetoes.push({ id: 'anomaly_reduce', reason: `unusual conditions: ${anomaly.reason}`, severity: 'soft' })
         }
       }
-      // Kelly sizing: compute optimal position size
+
       if (analysis.plan) {
-        const bmaSizeMod = bma ? bmaSizeMultiplier(bma) : 1
-        const uncertainty = estimateUncertainty(analysis.plan.winProbability ?? 0.5)
+        const verdictSize = verdict?.sizeMultiplier ?? 1
         this.kellyResult = computeKellySize({
-          winProbability: analysis.plan.winProbability ?? 0.5,
+          winProbability: analysis.plan.winProbability,
           avgWinR: analysis.plan.expectedRr ?? 2,
           avgLossR: 1,
-          uncertainty,
-          regimeMultiplier: (this.regime?.sizeMultiplier ?? 1) * bmaSizeMod,
+          uncertainty: estimateUncertainty(analysis.plan.winProbability),
+          regimeMultiplier: (this.regime?.sizeMultiplier ?? 1) * (verdictSize > 0 ? verdictSize : 1),
           consecutiveLosses: this.consecutiveLosses(instId),
           currentDrawdownR: this.currentDrawdownR(instId),
-          maxDrawdownR: 8,
+          maxDrawdownR: this.settings.evolution.rollbackMaxDrawdownR,
           volForecast: this.volForecast?.normalized ?? 0.5,
         })
-        log.info('kelly', `${instId} size=${this.kellyResult.sizeMultiplier.toFixed(2)}x risk=${(this.kellyResult.riskFraction * 100).toFixed(2)}% — ${this.kellyResult.reasons.slice(-1)[0]}`)
       }
     }
 
-    /* ---- AI arbitration, strictly gated ------------------------------- */
+    /* ---- optional AI narrative, strictly budget-gated ------------------ */
     const ai = this.settings.ai
     const aiUsage = this.store.aiUsageThisMonth()
-    const aiBudgetOk = aiUsage.spend < Math.max(0, this.settings.aiMonthlyBudgetEur)
     const hardVeto = analysis.vetoes.some((v) => v.severity === 'hard')
     const wantAi =
       (opts.withAi ?? true) &&
       ai.enabled &&
-      aiBudgetOk &&
+      aiUsage.spend < Math.max(0, this.settings.aiMonthlyBudgetEur) &&
       this.gemini.configured &&
       analysis.decision !== 'WAIT' &&
       analysis.conviction >= ai.minConvictionToAsk &&
       !hardVeto
-    const cooldownOk = Date.now() - (this.aiCooldown.get(k) ?? 0) > Math.max(ai.cooldownMs, 15_000)
-
-    if (wantAi && (cooldownOk || opts.withAi === true)) {
+    if (wantAi && (Date.now() - (this.aiCooldown.get(k) ?? 0) > Math.max(ai.cooldownMs, 15_000) || opts.withAi === true)) {
       try {
         this.aiCooldown.set(k, Date.now())
-        const opinion = await this.gemini.decide(analysis, { ...ai, model: ai.model })
+        const opinion = await this.gemini.decide(analysis, ai)
         if (opinion) {
           analysis.ai = opinion
           this.store.recordAiUsage(opinion.model, opinion.tokensIn, opinion.tokensOut, (opinion.tokensIn * 0.3 + opinion.tokensOut * 2.5) / 1_000_000)
-          if (!opinion.cached) {
-            log.ai(
-              'gemini',
-              `${instId} ${timeframe} → ${opinion.decision} @ ${opinion.confidence.toFixed(0)}% (${opinion.tokensIn}/${opinion.tokensOut} tok, ${opinion.latencyMs}ms): ${opinion.reasoning.slice(0, 220)}`,
-              { instId, timeframe },
-            )
-          }
         }
       } catch (err) {
         this.counters.errors++
@@ -829,47 +756,18 @@ export class Runtime {
       }
     }
 
-    this.analyses.set(k, analysis)
-
-    // Meta-playbook: adjust candidate scores based on regime-conditional historical performance
-    if (this.regime && analysis.decision !== 'WAIT') {
-      const candidates = evaluateStrategies(analysis)
-      const adjustments = adjustPlaybooksForRegime(
-        this.metaPlaybook,
-        this.regime.id,
-        candidates.map((c) => ({ playbookId: c.playbook, score: c.score })),
-      )
-      const topAdjust = adjustments.find((a) => Math.abs(a.adjustedScore - a.originalScore) > 5)
-      if (topAdjust) {
-        log.info('meta-playbook', `${instId} regime ${this.regime!.id}: ${topAdjust.playbookId} ${topAdjust.originalScore.toFixed(0)}→${topAdjust.adjustedScore.toFixed(0)} (${topAdjust.reason})`)
-      }
-    }
-
-    // Add explainability to narrative
-    if (this.explanation && analysis.decision !== 'WAIT') {
-      analysis.narrative.push(`── Explainability ──`)
-      analysis.narrative.push(this.explanation.summary)
-      for (const reason of this.explanation.topReasons.slice(0, 3)) {
-        analysis.narrative.push(`  • ${reason}`)
-      }
-    }
-    // Add regime info to narrative
     if (this.regime) {
-      analysis.narrative.push(`── Regime: ${this.regime.label} (${(this.regime.confidence * 100).toFixed(0)}% confidence, ${this.regime.sizeMultiplier}x size) ──`)
-    }
-    // Add Kelly sizing to narrative
-    if (this.kellyResult && analysis.plan) {
-      analysis.narrative.push(`── Kelly sizing: ${this.kellyResult.sizeMultiplier.toFixed(2)}x size, ${(this.kellyResult.riskFraction * 100).toFixed(2)}% risk ──`)
+      analysis.narrative.push(`── Regime: ${this.regime.label} (${(this.regime.confidence * 100).toFixed(0)}% confidence, ×${this.regime.sizeMultiplier} size) ──`)
     }
 
-    if (!opts.silent) {
-      await this.postAnalysis(analysis, prev)
-    }
+    this.analyses.set(k, analysis)
+    if (!opts.silent) await this.postAnalysis(analysis, prev, selected, instType)
     return analysis
   }
 
-  /** Alerting + journaling for a fresh analysis. */
-  private async postAnalysis(a: Analysis, prev: Analysis | null) {
+  /* ---- alerting + arming ---------------------------------------------- */
+
+  private async postAnalysis(a: Analysis, prev: Analysis | null, selected: StrategyCandidate | undefined, instType: string) {
     const inWatchlist = this.watchlist.some((w) => w.instId === a.instId)
     const ticker = this.tickers.get(a.instId)
     const candidates: AlertCandidate[] = []
@@ -879,13 +777,7 @@ export class Runtime {
       if (!scopeMatches(rule, a.instId, inWatchlist)) continue
       if (rule.timeframe && rule.timeframe !== 'any' && normalizeBar(rule.timeframe) !== a.timeframe) continue
       if (Date.now() - rule.lastFiredAt < rule.cooldownMs) continue
-      const hit = evaluateRule(rule, {
-        analysis: a,
-        previous: prev,
-        changePct24h: ticker?.changePct24h ?? null,
-        volUsd24h: ticker?.volUsd24h ?? null,
-        inWatchlist,
-      })
+      const hit = evaluateRule(rule, { analysis: a, previous: prev, changePct24h: ticker?.changePct24h ?? null, volUsd24h: ticker?.volUsd24h ?? null, inWatchlist })
       if (hit) candidates.push(hit)
     }
 
@@ -894,17 +786,13 @@ export class Runtime {
       if (Date.now() - last < 10 * 60_000) continue
       this.lastAlertAt.set(c.fingerprint, Date.now())
       this.counters.alerts++
-
       let delivered = false
       if (c.telegram && this.shouldNotify(a, c)) {
-        const html =
-          c.type === 'signal'
-            ? signalCard(a)
-            : alertCard({ ...c, analysis: c.severity === 'opportunity' ? a : null })
+        const html = c.type === 'signal' ? signalCard(a) : alertCard({ ...c, analysis: c.severity === 'opportunity' ? a : null })
         delivered = (await this.bot.broadcast(this.activeChats(), html)) > 0
       }
       log.alert('alerts', `${c.title} — ${c.message}`, { instId: a.instId, timeframe: a.timeframe })
-      const alertRecord = {
+      this.store.recordAlert({
         ruleId: c.ruleId,
         ruleName: c.ruleName,
         type: c.type,
@@ -916,14 +804,10 @@ export class Runtime {
         decision: c.decision,
         conviction: c.conviction,
         price: c.price,
-        payload: JSON.stringify(a.compact).slice(0, 3500),
         telegramDelivered: delivered,
         ts: Date.now(),
-      }
-      this.store.recordAlert(alertRecord)
-      if (convex.configured) await convex.recordAlert(alertRecord)
+      })
       if (c.ruleId) {
-        if (convex.configured) await convex.markRuleFired(c.ruleId, Date.now())
         const rule = this.rules.find((r) => r._id === c.ruleId)
         if (rule) {
           rule.lastFiredAt = Date.now()
@@ -933,21 +817,19 @@ export class Runtime {
       }
     }
 
-    await this.maybeJournal(a)
+    await this.maybeArm(a, selected, instType)
   }
 
-  private async maybeJournal(a: Analysis) {
+  private async maybeArm(a: Analysis, selected: StrategyCandidate | undefined, instType: string) {
     const featureTime = a.generatedAt - Math.max(0, a.dataQuality.staleMs)
-    const policyVersion = 'explicit-playbooks-v1'
     const decisionId = `${a.instId}:${a.timeframe}:${featureTime}`
-    const modelVersion = this.champion.modelVersion
-    this.store.recordDecision(decisionId, a, policyVersion, modelVersion)
+    const verdict = this.latestVerdicts.get(this.key(a.instId, a.timeframe)) ?? null
+    const modelVersion = selected ? this.evolution.primaryModelVersion({ playbook: selected.playbook, instType, timeframe: a.timeframe }) : 'deterministic-playbook'
+    this.store.recordDecision(decisionId, a, POLICY_VERSION, modelVersion)
 
-    const candidates = evaluateStrategies(a)
-    this.latestCandidates.set(this.key(a.instId, a.timeframe), candidates)
-    for (const candidate of candidates) {
+    for (const candidate of this.latestCandidates.get(this.key(a.instId, a.timeframe)) ?? []) {
       this.store.recordCandidate({
-        id: `${a.instId}:${a.timeframe}:${featureTime}:${candidate.playbook}:${candidate.side}`,
+        id: `${decisionId}:${candidate.playbook}:${candidate.side}`,
         observedAt: a.generatedAt,
         instId: a.instId,
         timeframe: a.timeframe,
@@ -955,7 +837,7 @@ export class Runtime {
         side: candidate.side,
         eligible: candidate.eligible,
         reasons: candidate.rejectionReasons,
-        policyVersion,
+        policyVersion: POLICY_VERSION,
         featureTime,
         latestSourceTime: featureTime,
         availableAt: a.generatedAt,
@@ -967,74 +849,122 @@ export class Runtime {
     if (a.decision === 'WAIT' || !a.plan) return
     if (a.conviction < this.settings.minConfidence || a.plan.netExpectancyR <= 0) return
     if (a.vetoes.some((v) => v.severity === 'hard')) return
-    const selected = candidates.find((candidate) => candidate.eligible && candidate.side === a.decision)
-    if (!selected) return
+    if (!selected || !selected.eligible || selected.side !== a.decision) return
+
     const active = [...this.paperTrades.values()].filter((trade) => trade.status === 'pending' || trade.status === 'open')
     if (active.some((trade) => trade.plan.instId === a.instId && trade.plan.timeframe === a.timeframe && trade.plan.side === a.decision)) return
 
+    const features = this.featureSnapshot(a, selected.score)
     const plan = createPaperPlan({
       id: `paper:${decisionId}:${selected.playbook}`,
       instId: a.instId,
       timeframe: a.timeframe,
       signalAt: a.generatedAt,
       playbook: selected.playbook,
-      policyVersion,
+      policyVersion: POLICY_VERSION,
       modelVersion,
       plan: a.plan,
       atrAtEntry: a.indicators.volatility.atr,
       feeBps: this.settings.takerFeeBps,
       fundingRate8h: a.derivatives?.fundingRate ?? undefined,
+      instType,
+      features,
+      featureSchema: FEATURE_SCHEMA,
+      committee: verdict
+        ? {
+            probability: verdict.probability,
+            confidence: verdict.confidence,
+            consensus: verdict.consensus,
+            agreement: verdict.agreement,
+            totalMembers: verdict.totalMembers,
+            sizeMultiplier: verdict.sizeMultiplier,
+            votes: verdict.votes.map((vote) => ({ id: vote.id, displayName: vote.displayName, generation: vote.generation, probability: vote.probability, weight: vote.weight })),
+          }
+        : null,
     })
-    const today = new Date(); today.setUTCHours(0, 0, 0, 0)
-    const realizedDailyR = this.store.listTrades(1000).filter((trade) => (trade.closedAt ?? 0) >= today.getTime()).reduce((sum, trade) => sum + trade.netRealizedR, 0)
-    const risk = assessPaperRisk(plan, {
-      equityUsd: this.settings.equityUsd,
-      openRiskUsd: active.reduce((sum, trade) => sum + trade.plan.riskUsd * trade.remaining, 0),
-      openNotionalUsd: active.reduce((sum, trade) => sum + trade.plan.quantity * trade.plan.entry * trade.remaining, 0),
-      realizedDailyR,
-      openTrades: active,
-    }, {
-      ...DEFAULT_RISK_POLICY,
-      maxOpenPositions: this.settings.maxOpenPositions,
-      maxDailyLossR: this.settings.maxDailyLossPct,
-      maxOpenRiskPct: this.settings.maxOpenRiskPct,
-      maxGrossExposurePct: this.settings.maxGrossExposurePct,
-    })
-    let trade = submitPaperPlan(plan)
+
+    const today = new Date()
+    today.setUTCHours(0, 0, 0, 0)
+    const realizedDailyR = this.store
+      .listTrades(1000)
+      .filter((trade) => (trade.closedAt ?? 0) >= today.getTime())
+      .reduce((sum, trade) => sum + trade.netRealizedR, 0)
+    const risk = assessPaperRisk(
+      plan,
+      {
+        equityUsd: this.settings.equityUsd,
+        openRiskUsd: active.reduce((sum, trade) => sum + trade.plan.riskUsd * trade.remaining, 0),
+        openNotionalUsd: active.reduce((sum, trade) => sum + trade.plan.quantity * trade.plan.entry * trade.remaining, 0),
+        realizedDailyR,
+        openTrades: active,
+      },
+      {
+        ...DEFAULT_RISK_POLICY,
+        maxOpenPositions: this.settings.maxOpenPositions,
+        maxDailyLossR: this.settings.maxDailyLossPct,
+        maxOpenRiskPct: this.settings.maxOpenRiskPct,
+        maxGrossExposurePct: this.settings.maxGrossExposurePct,
+      },
+    )
+
+    const trade = submitPaperPlan(plan)
     if (!risk.allowed) {
       trade.status = 'rejected'
       trade.exitReason = 'risk_rejected'
       trade.closedAt = Date.now()
       trade.events.push({ at: Date.now(), type: 'rejected', detail: risk.reasons.join(', ') })
-    } else {
-      this.paperTrades.set(trade.id, trade)
-      this.counters.signals++
-      // Record as canary trade if a canary is active
-      if (this.champion.canaryId) {
-        this.store.recordCanaryTrade(trade.id, this.champion.canaryId, a.generatedAt)
-      }
-      log.signal('paper', `armed ${a.decision} ${a.instId} ${a.timeframe} for paper validation only`, { instId: a.instId, timeframe: a.timeframe })
+      this.store.saveTrade(trade)
+      this.evolution.recordOutcome(trade, undefined, { instType, playbook: selected.playbook })
+      this.store.setState('last_risk_decision', risk)
+      return
     }
+
+    this.paperTrades.set(trade.id, trade)
+    this.counters.signals++
     this.store.saveTrade(trade)
     this.store.setState('last_risk_decision', risk)
+    log.signal('paper', `armed ${a.decision} ${a.instId} ${a.timeframe} · ${selected.playbook} · p=${(a.plan.winProbability * 100).toFixed(0)}%`, { instId: a.instId, timeframe: a.timeframe })
 
-    if (convex.configured) {
-      const record = toSignalRecord(a)
-      if (record) await convex.recordSignal(record)
+    await this.mirrorToDemo(trade, instType, selected.playbook, verdict)
+  }
+
+  private async mirrorToDemo(trade: PaperTrade, instType: string, playbook: string, verdict: CommitteeVerdict | null) {
+    if (!this.settings.execution.okxDemoEnabled || !this.demo.configured) return
+    if (!this.settings.execution.demoInstTypes.includes(instType as 'SPOT' | 'SWAP')) return
+    if (instType === 'SPOT' && trade.plan.side === 'SHORT') return
+    if (this.evolution.store.openOrders().length >= this.settings.execution.maxConcurrentDemoOrders) return
+    const spec = this.universe.get(trade.plan.instId)
+    if (!spec) return
+    const result = await this.demo.placeBracket(trade, spec, this.settings.execution.demoSizeMultiplier)
+    if (result.ok) this.counters.demoOrders++
+    if (this.settings.telegram.enabled && this.settings.telegram.orderCards) {
+      await this.bot.broadcast(
+        this.activeChats(),
+        orderCard({
+          kind: result.ok ? 'placed' : 'rejected',
+          instId: trade.plan.instId,
+          side: trade.plan.side,
+          timeframe: trade.plan.timeframe,
+          playbook,
+          px: result.px ?? trade.plan.entry,
+          sz: result.sz,
+          reason: result.reason,
+          modelName: verdict?.votes[0]?.displayName ?? null,
+          probability: verdict?.probability ?? null,
+        }),
+      )
     }
   }
 
   private shouldNotify(a: Analysis, c: AlertCandidate) {
     const t = this.settings.telegram
     if (!t.enabled || !this.bot.configured) return false
+    if (c.type === 'signal' && !t.signalCards) return false
     if (t.onlyWatchlist && !this.watchlist.some((w) => w.instId === a.instId)) return false
     if (c.type === 'signal' && a.conviction < t.minConviction) return false
     if (t.quietHoursStart !== t.quietHoursEnd) {
       const hour = new Date().getUTCHours()
-      const inQuiet =
-        t.quietHoursStart < t.quietHoursEnd
-          ? hour >= t.quietHoursStart && hour < t.quietHoursEnd
-          : hour >= t.quietHoursStart || hour < t.quietHoursEnd
+      const inQuiet = t.quietHoursStart < t.quietHoursEnd ? hour >= t.quietHoursStart && hour < t.quietHoursEnd : hour >= t.quietHoursStart || hour < t.quietHoursEnd
       if (inQuiet && c.severity !== 'critical') return false
     }
     return true
@@ -1061,8 +991,7 @@ export class Runtime {
 
   private async scanLoop() {
     const cfg = this.settings.scanner
-    if (!cfg.enabled || !this.settings.engineEnabled) return
-    if (this.scan.running) return
+    if (!cfg.enabled || !this.settings.engineEnabled || this.scan.running) return
     if (Date.now() - this.scan.at < cfg.intervalMs) return
     this.scan.running = true
     const started = Date.now()
@@ -1087,20 +1016,20 @@ export class Runtime {
                 scannedAt: Date.now(),
               })
             } catch {
-              /* a single instrument failing must not kill the scan */
+              /* one instrument failing must not kill the scan */
             }
           }),
         ),
       )
       rows.sort((a, b) => Math.abs(b.score) - Math.abs(a.score))
       this.scan = { at: Date.now(), scanned: rows.length, rows, running: false }
-      log.scan(
-        'scanner',
-        `${rows.length}/${targets.length} instruments scored in ${((Date.now() - started) / 1000).toFixed(1)}s · best ${rows
-          .slice(0, 3)
-          .map((r) => `${r.instId} ${r.score > 0 ? '+' : ''}${r.score.toFixed(0)}`)
-          .join(', ')}`,
-      )
+      log.scan('scanner', `${rows.length}/${targets.length} scored in ${((Date.now() - started) / 1000).toFixed(1)}s · best ${rows.slice(0, 3).map((r) => `${r.instId} ${r.score > 0 ? '+' : ''}${r.score.toFixed(0)}`).join(', ')}`)
+
+      // Run the FULL pipeline on the strongest scanner candidates so opportunity is
+      // not limited to the manually watched list.
+      for (const row of rows.filter((row) => Math.abs(row.score) >= 45).slice(0, 4)) {
+        await this.analyzeInstrument(row.instId, cfg.timeframe, { withAi: false })
+      }
     } finally {
       this.scan.running = false
     }
@@ -1116,8 +1045,7 @@ export class Runtime {
       .filter((t) => (cfg.includeEquities ? true : !isEquityInstrument(t.instId)))
       .filter((t) => this.universe.has(t.instId))
       .sort((a, b) => b.volUsd24h - a.volUsd24h)
-      .slice(0, Math.max(5, Math.min(cfg.universeSize, 200)))
-    // Always include the watchlist, whatever its turnover.
+      .slice(0, Math.max(5, Math.min(cfg.universeSize, 300)))
     for (const w of this.watchlist) {
       if (!out.some((t) => t.instId === w.instId)) {
         const t = this.tickers.get(w.instId)
@@ -1130,8 +1058,7 @@ export class Runtime {
   private async paperLoop() {
     for (const [id, existing] of this.paperTrades) {
       if (existing.status !== 'pending' && existing.status !== 'open') continue
-      const candles = candleStore.peek(existing.plan.instId, existing.plan.timeframe)
-        ?? (await candleStore.ensure(existing.plan.instId, existing.plan.timeframe, 300))
+      const candles = candleStore.peek(existing.plan.instId, existing.plan.timeframe) ?? (await candleStore.ensure(existing.plan.instId, existing.plan.timeframe, 300))
       let trade = existing
       let changed = false
       for (const candle of candles) {
@@ -1143,249 +1070,208 @@ export class Runtime {
       if (!changed) continue
       this.paperTrades.set(id, trade)
       this.store.saveTrade(trade)
-      if (trade.status === 'closed' || trade.status === 'expired') {
-        log.signal('paper', `${trade.plan.instId} ${trade.plan.side} ${trade.exitReason} ${trade.netRealizedR >= 0 ? '+' : ''}${trade.netRealizedR.toFixed(2)}R net`, { instId: trade.plan.instId, timeframe: trade.plan.timeframe })
-        // Record training row — always accumulate data, even without a champion
-        const analysis = this.analyses.get(this.key(trade.plan.instId, trade.plan.timeframe))
-        if (analysis) {
-          const candidates = evaluateStrategies(analysis)
-          const selected = candidates.find((c) => c.eligible && c.side === trade.plan.side)
-          const features = buildFeatureVector({
-            compositeScore: analysis.compositeScore,
-            mtfAlignment: analysis.mtfAlignment,
-            indicators: analysis.indicators,
-            playbookScore: selected?.score ?? 0,
-            marketContext: analysis.marketContext,
-            derivatives: analysis.derivatives,
-            crossAsset: this.crossAsset,
-            onChain: this.onChain,
-            orderBook: this.orderBook.get(trade.plan.instId) ?? null,
-            volForecast: this.volForecast,
-            regime: this.regime,
-          })
-          const trainingModelId = this.champion.current.modelId ?? 'baseline'
-          this.champion.recordTrainingRow({
-            modelId: trainingModelId,
-            observedAt: trade.plan.signalAt,
+      if (trade.status !== 'closed' && trade.status !== 'expired') continue
+
+      const playbook = trade.plan.playbook
+      const instType = trade.plan.instType ?? this.universe.get(trade.plan.instId)?.instType ?? 'SWAP'
+      // THE fix: learn from the frozen decision-time snapshot, never from now.
+      const attribution = this.evolution.recordOutcome(trade, trade.plan.features, {
+        instType,
+        playbook,
+        winProbability: trade.plan.committee?.probability ?? null,
+      })
+      log.signal(
+        'paper',
+        `${trade.plan.instId} ${trade.plan.side} ${trade.exitReason} ${trade.netRealizedR >= 0 ? '+' : ''}${trade.netRealizedR.toFixed(2)}R · ${attribution.reasonCode}`,
+        { instId: trade.plan.instId, timeframe: trade.plan.timeframe },
+      )
+      if (this.regime) recordPlaybookOutcome(this.metaPlaybook, playbook, this.regime.id, trade.netRealizedR > 0, trade.netRealizedR)
+      if (this.demo.configured) await this.demo.cancelForTrade(trade.id)
+      if (this.settings.telegram.enabled && this.settings.telegram.orderCards) {
+        await this.bot.broadcast(
+          this.activeChats(),
+          orderCard({
+            kind: 'closed',
             instId: trade.plan.instId,
+            side: trade.plan.side,
             timeframe: trade.plan.timeframe,
-            features,
-            label: trade.netRealizedR > 0 ? 1 : 0,
+            playbook,
             netR: trade.netRealizedR,
-            tradeId: trade.id,
-          })
-        }
-        // Record meta-playbook outcome for regime-conditional learning
-        if (analysis && this.regime) {
-          const candidates = evaluateStrategies(analysis)
-          const selected = candidates.find((c) => c.eligible && c.side === trade.plan.side)
-          if (selected) {
-            recordPlaybookOutcome(
-              this.metaPlaybook,
-              selected.playbook,
-              this.regime.id,
-              trade.netRealizedR > 0,
-              trade.netRealizedR,
-            )
-          }
-        }
-        // Close canary trade if this was a canary
-        if (this.champion.canaryId) {
-          this.store.closeCanaryTrade(trade.id, trade.closedAt ?? Date.now(), trade.netRealizedR)
-        }
+            reason: `${attribution.reasonCode} — ${attribution.detail}`,
+            modelName: trade.plan.committee?.votes[0]?.displayName ?? null,
+            probability: trade.plan.committee?.probability ?? null,
+          }),
+        )
       }
+      this.paperTrades.delete(id)
     }
-    // Check champion health for potential rollback
-    if (this.champion.hasChampion) {
-      const health = this.champion.health()
-      if (health.shouldRollback && health.reason) {
-        log.error('champion', `rollback triggered: ${health.reason}`)
-        this.champion.rollback(health.reason)
-      }
-    }
+  }
+
+  private async demoLoop() {
+    if (!this.demo.configured) return
+    await this.demo.sync()
+    await this.demo.refreshBalance()
   }
 
   private maintenanceLoop() {
     const keep = new Set([this.settings.instId, ...this.watchlist.map((row) => row.instId)])
     candleStore.evict(keep)
-    this.store.pruneCandles(Date.now() - 365 * 24 * 60 * 60_000)
+    // 400 GB of disk is available: keep two years of bars, they are the raw material
+    // for every future backtest. Only prune harder when the volume is genuinely tight.
+    const disk = diskUsage()
+    const tight = disk.freeBytes != null && disk.freeBytes < 20e9
+    this.store.pruneCandles(Date.now() - (tight ? 365 : 730) * 24 * 60 * 60_000)
     this.store.checkpoint()
   }
 
-  private async championLoop() {
-    if (!this.settings.engineEnabled) return
-
-    // 1. Check canary promotion: if a canary is running, evaluate it
-    if (this.champion.canaryId) {
-      const evaluation = this.champion.compareCanary(this.champion.canaryId)
-      if (evaluation.shouldPromote) {
-        log.info('champion', `auto-promoting canary ${this.champion.canaryId}: ${evaluation.reasons.join(', ')}`)
-        this.champion.promoteCanary(this.champion.canaryId)
-        // Sync anomaly model from champion to runtime after promotion
-        this.anomalyModel = this.champion.anomalyModel
-      } else if (evaluation.reasons.some((r) => r.includes('canary_expired_by_age'))) {
-        log.info('champion', `canary expired by age, retiring: ${evaluation.reasons.join(', ')}`)
-        this.store.retireModel(this.champion.canaryId, 'canary_expired', 'retired')
-        this.champion.loadCanaryFromStore()
-      }
+  private async backupLoop() {
+    try {
+      const destination = backupFileName()
+      const result = await this.store.backup(destination)
+      const pruned = pruneBackups(12)
+      log.info('backup', `snapshot ${destination.split('/').pop()} (${result.pages} pages), pruned ${pruned} old snapshot(s)`)
+    } catch (error) {
+      log.error('backup', error instanceof Error ? error.message : String(error))
     }
+  }
 
-    // 2. Auto-retrain: every 50 closed trades or 6 hours, whichever comes first
-    if (this.champion.hasChampion) {
-      const lastRetrain = this.store.getState<number>('last_champion_retrain', 0)
-      const retrainIntervalMs = Number(process.env.CHAMPION_RETRAIN_INTERVAL_MS ?? 6 * 60 * 60_000)
-      const retrainMinTrades = Number(process.env.CHAMPION_RETRAIN_MIN_TRADES ?? 50)
-      const trainingRows = this.champion.current.modelId ? this.store.listTrainingRows(this.champion.current.modelId).length : 0
-      const baselineRows = this.store.listTrainingRows('baseline').length
-      const totalRows = trainingRows + baselineRows
-      const dueByTime = Date.now() - lastRetrain > retrainIntervalMs
-      const dueByTrades = totalRows >= retrainMinTrades
-      if (dueByTime || dueByTrades) {
-        log.info('champion', `auto-retrain triggered (time=${dueByTime}, trades=${totalRows}>=${retrainMinTrades})`)
-        // If we have baseline data, merge it into the champion's training set first
-        if (baselineRows > 0 && this.champion.current.modelId) {
-          const baseline = this.store.listTrainingRows('baseline')
-          for (const row of baseline) {
-            this.store.recordTrainingRow({
-              modelId: this.champion.current.modelId,
-              observedAt: row.observed_at,
-              instId: row.inst_id,
-              timeframe: row.timeframe,
-              features: row.features,
-              label: row.label,
-              netR: row.net_r ?? undefined,
-              tradeId: row.trade_id ?? undefined,
-              source: 'baseline_merge',
-            })
-          }
-          // Clear baseline rows after merging
-          this.store.setState('baseline_merged_at', Date.now())
-        }
-        const result = this.champion.retrainChampion()
-        if (result.accepted) {
-          this.store.setState('last_champion_retrain', Date.now())
-          // Sync anomaly model from champion to runtime
-          this.anomalyModel = this.champion.anomalyModel
-          log.info('champion', `retrain accepted: ${result.reason} (anomaly model synced, features: ${this.champion.featureImportance.length})`)
-        } else {
-          log.info('champion', `retrain skipped: ${result.reason}`)
-          // Still update the timestamp so we don't retry every 10 min
-          this.store.setState('last_champion_retrain', Date.now())
-        }
-      }
-    } else if (!this.champion.canaryId) {
-      // 3. No champion and no canary: if we have enough baseline data, try to train a first champion
-      const baselineRows = this.store.listTrainingRows('baseline').length
-      if (baselineRows >= 30) {
-        log.info('champion', `attempting to train first champion from ${baselineRows} baseline rows`)
-        // Register a model from baseline training data
-        const baseline = this.store.listTrainingRows('baseline')
-        const { trainCalibratedLinear } = await import('./research/calibration.js')
-        const { manifestHash } = await import('./research/validation.js')
-        const { writeFileSync, mkdirSync } = await import('node:fs')
-        const { join, resolve } = await import('node:path')
-        const { generateModelName } = await import('./research/naming.js')
-        const { FEATURE_ORDER } = await import('./research/features.js')
-        const labelled = baseline.map((r) => ({ at: r.observed_at, symbol: r.inst_id, features: r.features, label: r.label as 0 | 1 }))
-        const model = trainCalibratedLinear(labelled)
-        if (model) {
-          const artifactHash = manifestHash(model)
-          const root = resolve(process.env.RESEARCH_ARTIFACTS_PATH ?? join(process.cwd(), 'data/research-artifacts'), artifactHash)
-          mkdirSync(root, { recursive: true })
-          const artifactPath = join(root, 'model.json')
-          writeFileSync(artifactPath, JSON.stringify({ model, featureOrder: FEATURE_ORDER }, null, 2))
-          const modelId = `model:${artifactHash.slice(0, 16)}`
-          const name = generateModelName()
-          this.store.registerModel({
-            id: modelId, state: 'paper_champion', strategy: 'baseline-trained',
-            version: artifactHash.slice(0, 12),
-            metrics: { validationBrier: model.validationBrier, trainedRows: model.trainedRows, validationRows: model.validationRows, source: 'baseline' },
-            artifactPath,
-            displayName: name,
-            generation: 1,
-          })
-          // Merge baseline rows into the new champion
-          for (const row of baseline) {
-            this.store.recordTrainingRow({
-              modelId, observedAt: row.observed_at, instId: row.inst_id, timeframe: row.timeframe,
-              features: row.features, label: row.label, netR: row.net_r ?? undefined,
-              tradeId: row.trade_id ?? undefined, source: 'baseline_merge',
-            })
-          }
-          this.champion.loadFromStore()
-          this.store.setState('last_champion_retrain', Date.now())
-          log.info('champion', `first champion trained from baseline data: ${modelId}`)
-        }
-      }
+  /**
+   * Keep the evidence base growing. On a cold volume this bootstraps ~1000 real
+   * point-in-time samples within minutes; afterwards it only tops up the tail.
+   */
+  private async harvestLoop() {
+    if (!this.settings.engineEnabled || !this.settings.evolution.enabled) return
+    if (this.harvester.progress.running) return
+    const total = this.evolution.store.sampleTotal()
+    const cold = total < this.settings.evolution.minNicheSamples * 8
+    const last = this.store.getState<{ at?: number }>('harvest_last', {})
+    if (!cold && Date.now() - (last.at ?? 0) < 12 * 60 * 60_000) return
+    log.info('harvest', cold ? `cold start (${total} samples) — bootstrapping the evidence base` : 'scheduled top-up')
+    await this.harvester.run({ perType: cold ? 8 : 4, timeframes: cold ? ['15m', '1H'] : ['15m'], barsPerSymbol: cold ? 1200 : 600, maxWallMs: cold ? 10 * 60_000 : 4 * 60_000 })
+  }
+
+  /** The self-improvement heartbeat: evolve, promote, roll back, refit anomaly. */
+  private evolutionLoop() {
+    if (!this.settings.engineEnabled || !this.settings.evolution.enabled) return
+    this.evolution.lifecycle(this.settings)
+    const eligible = this.evolution.eligibleNiches(this.settings)
+    if (eligible.length) {
+      // One niche per tick keeps the CPU budget predictable on an 8 GB mini PC.
+      const target = eligible[0]
+      log.info('evolution', `evolving ${nicheKey(target.niche)} · ${target.samples} samples (+${target.newSamples} new)`)
+      this.evolution.evolveOne(target.niche, this.settings)
     }
+    const samples = this.evolution.store.listSamples({ limit: 2000 })
+    if (samples.length >= 60) this.anomalyModel = fitAnomalyModel(samples.map((row) => row.features), [...FEATURE_ORDER])
   }
 
   private async autoResearchLoop() {
     if (!this.settings.engineEnabled || !this.settings.autoResearchEnabled) return
     const state = this.store.researchState()
     const latest = state.campaigns.reduce((max, campaign) => Math.max(max, Number(campaign.created_at ?? 0)), 0)
-    const intervalMs = Math.max(6, this.settings.researchIntervalHours) * 60 * 60_000
-    if (latest && Date.now() - latest < intervalMs) return
-    const governor = this.research.governor()
-    if (!governor.allowed) return
+    if (latest && Date.now() - latest < Math.max(1, this.settings.researchIntervalHours) * 60 * 60_000) return
+    if (!this.research.governor().allowed) return
 
-    // Rotate through campaign types for systematic exploration
-    const campaignTypes: CampaignType[] = [
-      'baseline', 'multi_symbol', 'ensemble', 'triple_barrier',
-      'feature_rich', 'high_conviction', 'low_conviction', 'regime_aware',
-    ]
-    const recentTypes = state.campaigns
-      .slice(-8)
+    // Evidence first: if the failure histogram is telling us something, test THAT.
+    const evidence = hypothesisFromAttribution(this.evolution.store.attributionSummary())
+    const campaignTypes: CampaignType[] = ['baseline', 'spot_swap', 'multi_symbol', 'triple_barrier', 'feature_rich', 'high_conviction', 'low_conviction', 'regime_aware', 'timeframe_sweep']
+    const recent = state.campaigns
+      .slice(0, 8)
       .map((c) => (c.manifest as Record<string, unknown>)?.campaignType as string | undefined)
       .filter(Boolean) as string[]
-    const nextType = campaignTypes.find((t) => !recentTypes.includes(t)) ?? campaignTypes[0]
+    const nextType = (evidence?.campaignType as CampaignType | undefined) ?? campaignTypes.find((t) => !recent.includes(t)) ?? 'baseline'
 
-    log.info('research', `starting scheduled ${nextType} campaign`)
-    const result = await this.research.run({
-      type: nextType as CampaignType,
-      hypothesis: `Scheduled ${nextType} campaign: ${CAMPAIGN_CONFIGS[nextType as CampaignType]?.hypothesis ?? 'exploratory'}`,
-    })
-    log.info('research', `scheduled ${nextType} campaign ${result.status}: ${result.validationState} — ${result.promotionReasons.join(', ') || 'all gates passed'}`)
+    log.info('research', `campaign ${nextType}${evidence ? ` triggered by ${evidence.reasonCode}` : ' (scheduled rotation)'}`)
+    const result = await this.research.run({ type: nextType, hypothesis: evidence?.hypothesis })
+    log.info('research', `${nextType} ${result.status}: ${result.samplesEmitted} historical samples harvested · ${result.validationState}`)
   }
 
-  /** Legacy Convex journal is retained read-only; SQLite paper events are the execution truth. */
-  private async journalLoop() {
-    return
+  /* ---- telegram reporting --------------------------------------------- */
+
+  private async reportLoop() {
+    if (!this.bot.configured || !this.settings.telegram.enabled) return
+    const chats = this.activeChats()
+    if (!chats.length) return
+    const now = new Date()
+
+    if (this.settings.telegram.heartbeatHours > 0) {
+      const last = this.store.getState<number>('last_heartbeat_at', 0)
+      if (Date.now() - last > this.settings.telegram.heartbeatHours * 60 * 60_000) {
+        this.store.setState('last_heartbeat_at', Date.now())
+        const today = this.todayStats()
+        await this.bot.broadcast(
+          chats,
+          heartbeatCard({
+            uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
+            samples: this.evolution.store.sampleTotal(),
+            championCount: this.evolution.store.listByLifecycle('champion').length,
+            openTrades: this.store.loadActiveTrades().length,
+            closedToday: today.closed,
+            sumRToday: today.sumR,
+            validationState: this.evolution.snapshot().validationState,
+            wsHealthy: this.stream.health().public.healthy,
+          }),
+        )
+      }
+    }
+
+    if (this.settings.telegram.dailyDigest && now.getUTCHours() === this.settings.telegram.digestHourUtc) {
+      const key = `digest:${now.toISOString().slice(0, 10)}`
+      if (this.store.getState<string>('last_digest_key', '') !== key) {
+        this.store.setState('last_digest_key', key)
+        await this.bot.broadcast(chats, digestCard(this.digestInput()))
+      }
+    }
+  }
+
+  private todayStats() {
+    const start = new Date()
+    start.setUTCHours(0, 0, 0, 0)
+    const trades = this.store.listTrades(2000, 'closed').filter((trade) => (trade.closedAt ?? 0) >= start.getTime())
+    return {
+      closed: trades.length,
+      sumR: trades.reduce((sum, trade) => sum + trade.netRealizedR, 0),
+      wins: trades.filter((trade) => trade.netRealizedR > 0).length,
+    }
+  }
+
+  digestInput() {
+    const snapshot = this.evolution.snapshot()
+    const disk = diskUsage()
+    const paper = this.store.paperStats()
+    const demo = this.demo.health()
+    return {
+      uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
+      engineEnabled: this.settings.engineEnabled,
+      instruments: this.universe.size,
+      samples: snapshot.summary.samples,
+      specialists: snapshot.summary.specialists,
+      championCount: snapshot.summary.champions,
+      validationState: snapshot.validationState,
+      paper: { total: paper.total, closed: paper.closed, open: paper.open, winRate: paper.winRate, avgR: paper.avgR, sumR: paper.sumR },
+      today: this.todayStats(),
+      champions: snapshot.specialists
+        .filter((row) => row.lifecycle === 'champion')
+        .map((row) => ({ displayName: row.displayName, nicheKey: row.nicheKey, generation: row.generation, liveTrades: row.liveTrades, liveMeanR: row.liveMeanR })),
+      attribution: snapshot.attribution,
+      demo: { configured: demo.configured, reason: demo.reason, placed: demo.placed, filled: demo.filled, rejected: demo.rejected, equityUsd: demo.equityUsd },
+      aiSpendEur: this.store.aiUsageThisMonth().spend,
+      aiBudgetEur: this.settings.aiMonthlyBudgetEur,
+      diskFreeGb: disk.freeBytes != null ? disk.freeBytes / 1e9 : null,
+    }
   }
 
   private async telemetryLoop() {
+    if (!ENV.convexMirror) return
     const health = this.stream.health()
-    const ai = this.gemini.stats()
-    await convex.ping('engine', this.settings.engineEnabled ? 'online' : 'degraded',
-      `${this.settings.instId} ${this.settings.timeframe} · ${this.universe.size} instruments · ${candleStore.stats().series} series`,
-      {
-        evaluations: this.counters.evaluations,
-        alerts: this.counters.alerts,
-        errors: this.counters.errors,
-        wsMessages: this.counters.wsMessages,
-        restCalls: restStats.calls,
-      })
-    await convex.ping(
-      'okx_ws',
-      health.public.healthy && health.business.healthy ? 'online' : health.public.healthy || health.business.healthy ? 'degraded' : 'offline',
-      `public ${health.public.subs} subs / business ${health.business.subs} subs`,
-      { wsMessages: this.counters.wsMessages },
-    )
-    await convex.ping(
-      'okx_rest',
-      restStats.errors > 0 && Date.now() - restStats.lastErrorAt < 60_000 ? 'degraded' : 'online',
-      `${restStats.calls} calls · ${restStats.avgLatencyMs.toFixed(0)}ms avg${restStats.lastError ? ` · ${restStats.lastError}` : ''}`,
-      { restCalls: restStats.calls, errors: restStats.errors },
-    )
-    if (this.gemini.configured) {
-      await convex.ping('ai', ai.errors && Date.now() - ai.lastCallAt < 120_000 ? 'degraded' : 'online',
-        `${this.settings.ai.model} · ${ai.calls} calls · ${ai.cacheHits} cached · ${ai.tokensIn}/${ai.tokensOut} tokens`,
-        { aiCalls: ai.calls, aiCacheHits: ai.cacheHits, tokensIn: ai.tokensIn, tokensOut: ai.tokensOut })
-    }
-    if (this.bot.configured) {
-      await convex.ping('telegram', this.bot.failed > this.bot.sent ? 'degraded' : 'online',
-        `@${this.bot.me?.username ?? '?'} · ${this.bot.sent} sent · ${this.chats.length} chat(s)`)
-    }
+    await convex.ping('engine', this.settings.engineEnabled ? 'online' : 'degraded', `${this.settings.instId} ${this.settings.timeframe} · ${this.universe.size} instruments`, {
+      evaluations: this.counters.evaluations,
+      alerts: this.counters.alerts,
+      errors: this.counters.errors,
+      wsMessages: this.counters.wsMessages,
+      restCalls: restStats.calls,
+    })
+    await convex.ping('okx_ws', health.public.healthy ? 'online' : 'degraded', `public ${health.public.subs} subs / business ${health.business.subs} subs`)
   }
 
   /* ---- symbol resolution ---------------------------------------------- */
@@ -1395,12 +1281,10 @@ export class Runtime {
     const raw = input.trim().toUpperCase()
     if (this.universe.has(raw)) return raw
     if (this.universe.size === 0) return raw.includes('-') ? raw : `${raw}-USDT-SWAP`
-    const candidates = [`${raw}-USDT-SWAP`, `${raw}-USDT`, `${raw}-USDC-SWAP`, `${raw}-USD-SWAP`]
-    for (const c of candidates) if (this.universe.has(c)) return c
+    for (const c of [`${raw}-USDT-SWAP`, `${raw}-USDT`, `${raw}-USDC-SWAP`, `${raw}-USD-SWAP`]) if (this.universe.has(c)) return c
     const partial = [...this.universe.keys()].find((k) => k.startsWith(`${raw}-`))
     if (partial) return partial
-    const loose = [...this.universe.keys()].find((k) => k.replace(/-/g, '').includes(raw.replace(/-/g, '')))
-    return loose ?? null
+    return [...this.universe.keys()].find((k) => k.replace(/-/g, '').includes(raw.replace(/-/g, ''))) ?? null
   }
 
   searchUniverse(query: string, instType?: string, limit = 40) {
@@ -1435,27 +1319,32 @@ export class Runtime {
     const { command, args, chatId } = ctx
     switch (command) {
       case 'start': {
-        await convex.registerChat(chatId, ctx.from.firstName, ctx.from.username)
-        if (!this.chats.includes(chatId)) this.chats.push(chatId)
-        this.mutedChats.delete(chatId)
+        this.registerChat(chatId, ctx.from.firstName, ctx.from.username)
         log.info('telegram', `chat ${chatId} registered (${ctx.from.firstName ?? 'unknown'})`)
-        return `\u{1F44B} <b>Welcome ${ctx.from.firstName ?? 'trader'}</b>\nThis chat is now registered for live OKX decisions.\n\n${HELP}`
+        return `\u{1F44B} <b>Welcome ${ctx.from.firstName ?? 'trader'}</b>\nThis chat now receives live OKX decisions, demo order cards and evolution events.\n\n${HELP}`
       }
       case 'help':
         return HELP
       case 'status':
         return this.statusHtml()
+      case 'digest':
+        return digestCard(this.digestInput())
+      case 'models': {
+        const rows = this.evolution.snapshot().specialists.filter((row) => row.lifecycle === 'champion' || row.lifecycle === 'canary')
+        if (!rows.length) return 'No specialist has been born yet. The system is still collecting evidence — that is the honest state, not a failure.'
+        return `\u{1F9EC} <b>Live specialists</b>\n<pre>${rows
+          .map((row) => `${row.displayName.padEnd(18).slice(0, 18)} G${row.generation} ${row.lifecycle.padEnd(8)} ${row.nicheKey} ${row.liveTrades}t ${row.liveMeanR == null ? '—' : `${row.liveMeanR >= 0 ? '+' : ''}${row.liveMeanR.toFixed(2)}R`}`)
+          .join('\n')}</pre>`
+      }
       case 'settings': {
         const s = this.settings
-        return `\u{2699} <b>Configuration</b>\n<pre>focus       ${s.instId} ${s.timeframe} (HTF ${s.htfTimeframe}/${s.htf2Timeframe})\nstrategy    ${s.strategy}\nrisk        ${s.riskPerTradePct}% of ${fmtUsd(s.equityUsd)} · max ${s.leverage}x · min ${s.rrRatio}R\ngates       conviction ≥ ${s.minConfidence} · composite ≥ ${s.minCompositeScore} · ADX ≥ ${s.minAdx} · ATR ≤ ${s.maxAtrPct}%\nai          ${s.ai.enabled ? s.ai.model : 'off'} · depth ${s.ai.contextDepth} · ask ≥ ${s.ai.minConvictionToAsk}\nscanner     ${s.scanner.enabled ? `${s.scanner.instTypes.join('/')} top ${s.scanner.universeSize} ≥ ${fmtUsd(s.scanner.minVol24hUsd)}` : 'off'}\ntelegram    ≥ ${s.telegram.minConviction} conviction${s.telegram.onlyWatchlist ? ' · watchlist only' : ''}</pre>`
+        return `\u{2699} <b>Configuration</b>\n<pre>focus       ${s.instId} ${s.timeframe} (HTF ${s.htfTimeframe}/${s.htf2Timeframe})\nstrategy    ${s.strategy}\nrisk        ${s.riskPerTradePct}% of ${fmtUsd(s.equityUsd)} · max ${s.leverage}x · min ${s.rrRatio}R\ngates       conviction \u2265 ${s.minConfidence} · composite \u2265 ${s.minCompositeScore} · ADX \u2265 ${s.minAdx}\nevolution   ${s.evolution.enabled ? `on · pop ${s.evolution.populationSize} \u00D7 ${s.evolution.generations} gens · placebo ${s.evolution.placebo ? 'on' : 'off'}` : 'off'}\ndemo orders ${s.execution.okxDemoEnabled ? (this.demo.configured ? 'live' : `blocked: ${this.demo.blockReason}`) : 'off'}\nscanner     ${s.scanner.enabled ? `${s.scanner.instTypes.join('/')} top ${s.scanner.universeSize}` : 'off'}\nsaved       ${this.settingsSavedAt ? new Date(this.settingsSavedAt).toISOString() : 'defaults'}</pre>`
       }
       case 'mute':
-        this.mutedChats.add(chatId)
-        await convex.muteChat(chatId, true)
-        return '\u{1F507} Muted. Send /unmute to resume alerts.'
+        this.setChatMuted(chatId, true)
+        return '\u{1F507} Muted. Send /unmute to resume.'
       case 'unmute':
-        this.mutedChats.delete(chatId)
-        await convex.muteChat(chatId, false)
+        this.setChatMuted(chatId, false)
         return '\u{1F514} Alerts resumed.'
       case 'a':
       case 'analyze': {
@@ -1466,41 +1355,44 @@ export class Runtime {
         return a ? signalCard(a) : 'Analysis failed — not enough data for that instrument.'
       }
       case 'watch': {
-        if (!args.length) return 'Usage: <code>/watch NVDA 1H</code>'
+        if (!args.length) return 'Usage: <code>/watch SOL 1H</code>'
         const instId = this.resolveInstId(args[0])
         if (!instId) return `Unknown instrument <code>${args[0]}</code>.`
-        const spec = this.universe.get(instId)
-        await convex.addWatch(instId, spec?.instType ?? 'SWAP', normalizeBar(args[1] ?? this.settings.timeframe))
-        await this.refreshSettings()
+        this.addWatch(instId, this.universe.get(instId)?.instType ?? 'SWAP', normalizeBar(args[1] ?? this.settings.timeframe))
         this.syncSubscriptions()
-        return `\u{1F440} Watching <code>${instId}</code> on ${normalizeBar(args[1] ?? this.settings.timeframe)}.`
+        return `\u{1F440} Watching <code>${instId}</code>.`
       }
       case 'unwatch': {
-        if (!args.length) return 'Usage: <code>/unwatch NVDA</code>'
+        if (!args.length) return 'Usage: <code>/unwatch SOL</code>'
         const instId = this.resolveInstId(args[0])
         if (!instId) return `Unknown instrument <code>${args[0]}</code>.`
-        await convex.removeWatch(instId)
-        await this.refreshSettings()
+        this.removeWatch(instId)
         this.syncSubscriptions()
-        return `Removed <code>${instId}</code> from the watchlist.`
+        return `Removed <code>${instId}</code>.`
       }
       case 'list': {
         if (!this.watchlist.length) return 'Watchlist is empty. Add one with <code>/watch BTC 15m</code>.'
-        const lines = this.watchlist.map((w) => {
-          const a = this.analyses.get(this.key(w.instId, w.timeframe || this.settings.timeframe))
-          const t = this.tickers.get(w.instId)
-          return `${w.instId} ${w.timeframe} — ${a ? `${a.decision} ${a.conviction.toFixed(0)}/100 · ${a.regime.toLowerCase()}` : 'warming up'} · ${fmtPrice(t?.last ?? 0)} ${t ? fmtPct(t.changePct24h, 1) : ''}`
-        })
-        return `\u{1F440} <b>Watchlist</b>\n<pre>${lines.join('\n')}</pre>`
+        return `\u{1F440} <b>Watchlist</b>\n<pre>${this.watchlist
+          .map((w) => {
+            const a = this.analyses.get(this.key(w.instId, w.timeframe || this.settings.timeframe))
+            const t = this.tickers.get(w.instId)
+            return `${w.instId} ${w.timeframe} — ${a ? `${a.decision} ${a.conviction.toFixed(0)}/100` : 'warming up'} · ${fmtPrice(t?.last ?? 0)} ${t ? fmtPct(t.changePct24h, 1) : ''}`
+          })
+          .join('\n')}</pre>`
       }
       case 'scan': {
         if (!this.scan.rows.length) return 'No scan yet — give the engine a minute.'
-        const top = this.scan.rows.slice(0, 10)
-        const lines = top.map(
-          (r) =>
-            `${r.instId.padEnd(18)} ${(r.score > 0 ? '+' : '') + r.score.toFixed(0).padStart(4)} ${r.bias.padEnd(8)} ${r.regime.toLowerCase().padEnd(14)} RSI ${r.rsi.toFixed(0).padStart(3)} ATR ${r.atrPct.toFixed(2)}%`,
-        )
-        return `\u{1F50E} <b>Best setups</b> (${this.scan.scanned} scanned)\n<pre>${lines.join('\n')}</pre>\nUse <code>/analyze SYMBOL</code> for the full plan.`
+        return `\u{1F50E} <b>Best setups</b> (${this.scan.scanned} scanned)\n<pre>${this.scan.rows
+          .slice(0, 10)
+          .map((r) => `${r.instId.padEnd(18)} ${(r.score > 0 ? '+' : '') + r.score.toFixed(0).padStart(4)} ${r.bias.padEnd(8)} RSI ${r.rsi.toFixed(0).padStart(3)}`)
+          .join('\n')}</pre>`
+      }
+      case 'why': {
+        const summary = this.evolution.store.attributionSummary()
+        if (!summary.length) return 'No closed trades yet.'
+        return `\u{1F50D} <b>Why trades ended</b> (30d)\n<pre>${summary
+          .map((row) => `${String(row.count).padStart(4)} ${row.meanR >= 0 ? '+' : ''}${row.meanR.toFixed(2)}R  ${REASON_LABELS[row.reasonCode as ReasonCode] ?? row.reasonCode}`)
+          .join('\n')}</pre>`
       }
       default:
         return `Unknown command <code>/${command}</code>.\n\n${HELP}`
@@ -1522,12 +1414,8 @@ export class Runtime {
       ws: { public: health.public.healthy, business: health.business.healthy, subs: health.public.subs + health.business.subs },
       rest: { calls: restStats.calls, errors: restStats.errors, avgLatencyMs: restStats.avgLatencyMs },
       ai: { configured: ai.configured, calls: ai.calls, cacheHits: ai.cacheHits, tokensIn: ai.tokensIn, tokensOut: ai.tokensOut, model: this.settings.ai.model },
-      convex: `${convex.health.status} · ${convex.health.writes}w/${convex.health.reads}r`,
-      scanner: {
-        lastRunAt: this.scan.at,
-        scanned: this.scan.scanned,
-        top: this.scan.rows.slice(0, 5).map((r) => `${r.instId} ${r.score > 0 ? '+' : ''}${r.score.toFixed(0)} ${r.bias.toLowerCase()}`),
-      },
+      convex: ENV.convexMirror ? `${convex.health.status} · mirror` : 'disabled (SQLite is truth)',
+      scanner: { lastRunAt: this.scan.at, scanned: this.scan.scanned, top: this.scan.rows.slice(0, 5).map((r) => `${r.instId} ${r.score > 0 ? '+' : ''}${r.score.toFixed(0)}`) },
       equityUsd: this.settings.equityUsd,
       uptimeSec: Math.floor((Date.now() - this.startedAt) / 1000),
       alerts24h: this.counters.alerts,
@@ -1536,9 +1424,9 @@ export class Runtime {
 
   health() {
     const wsHealth = this.stream.health()
-    const research = this.store.researchState()
     const aiUsage = this.store.aiUsageThisMonth()
-    const rssMb = process.memoryUsage().rss / 1024 / 1024
+    const snapshot = this.evolution.snapshot()
+    const disk = diskUsage()
     return {
       ok: true,
       startedAt: this.startedAt,
@@ -1551,15 +1439,23 @@ export class Runtime {
       rest: { ...restStats },
       ai: { ...this.gemini.stats(), monthlySpendEur: aiUsage.spend, monthlyBudgetEur: this.settings.aiMonthlyBudgetEur, budgetBlocked: aiUsage.spend >= this.settings.aiMonthlyBudgetEur },
       telegram: { ...this.bot.stats(), chats: this.chats.length, muted: this.mutedChats.size },
-      convex: convex.health,
-      localStore: this.store.summary(),
+      storage: { ...disk, restoredFrom: this.store.restoredFrom, backups: listBackups().length, tables: this.store.summary() },
       paper: { ...this.store.paperStats(), active: this.store.loadActiveTrades().length, killSwitch: this.paperKillSwitch },
-      research: { validationState: research.validationState, governor: this.research.governor(), champion: research.champion, canary: research.canary, championModel: this.champion.current },
-      resources: { rssMb, freeMemoryMb: freemem() / 1024 / 1024, totalMemoryMb: totalmem() / 1024 / 1024, load1: loadavg()[0] },
+      evolution: {
+        validationState: snapshot.validationState,
+        ...snapshot.summary,
+        nicheCount: snapshot.niches.length,
+        championList: snapshot.specialists
+          .filter((row) => row.lifecycle === 'champion')
+          .map((row) => ({ displayName: row.displayName, nicheKey: row.nicheKey, generation: row.generation, liveTrades: row.liveTrades, liveMeanR: row.liveMeanR, brier: (row.metrics as { brier?: number })?.brier ?? null })),
+      },
+      demoExecution: { ...this.demo.health(), parity: this.demo.parityReport() },
+      resources: { rssMb: process.memoryUsage().rss / 1024 / 1024, freeMemoryMb: freemem() / 1024 / 1024, totalMemoryMb: totalmem() / 1024 / 1024, load1: loadavg()[0] },
       counters: this.counters,
       scanner: { at: this.scan.at, scanned: this.scan.scanned, running: this.scan.running },
       account: this.account,
       okxKeys: HAS_OKX_KEYS,
+      settingsSavedAt: this.settingsSavedAt,
       analyses: this.analyses.size,
       marketContext: this.marketContext,
       edge: {
@@ -1570,9 +1466,6 @@ export class Runtime {
         anomaly: this.anomalyResult ? { isAnomaly: this.anomalyResult.isAnomaly, action: this.anomalyResult.action, score: this.anomalyResult.anomalyScore } : null,
         kelly: this.kellyResult ? { sizeMultiplier: this.kellyResult.sizeMultiplier, riskFraction: this.kellyResult.riskFraction } : null,
         explanation: this.explanation ? { summary: this.explanation.summary, topReasons: this.explanation.topReasons.slice(0, 3) } : null,
-        bma: this.bmaResult ? { consensus: this.bmaResult.consensus, prediction: this.bmaResult.prediction, confidence: this.bmaResult.confidence, agreement: this.bmaResult.agreement, totalModels: this.bmaResult.totalModels } : null,
-        featureImportance: this.champion.featureImportance.slice(0, 5),
-        cpcv: this.champion.cpcvResult,
       },
     }
   }

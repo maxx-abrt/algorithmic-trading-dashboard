@@ -33,6 +33,25 @@ export interface PaperPlan {
   fundingRate8h?: number
   atrAtEntry: number
   trailAtrMult: number
+  /** SPOT | SWAP | FUTURES — part of the specialist niche key */
+  instType?: string
+  /**
+   * THE point-in-time feature snapshot, frozen at decision time.
+   * Recomputing features when the trade closes leaks the future into the label and
+   * is the single defect that makes a learning loop produce noise. Never recompute.
+   */
+  features?: number[]
+  featureSchema?: string
+  /** committee verdict recorded at decision time, for forward attribution */
+  committee?: {
+    probability: number
+    confidence: number
+    consensus: string
+    agreement: number
+    totalMembers: number
+    sizeMultiplier: number
+    votes: { id: string; displayName: string; generation: number; probability: number; weight: number }[]
+  } | null
 }
 
 export interface PaperEvent {
