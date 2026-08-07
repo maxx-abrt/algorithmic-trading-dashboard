@@ -1,0 +1,11 @@
+[core]
+	repositoryformatversion = 0
+	filemode = true
+	bare = false
+	logallrefupdates = true
+[remote "origin"]
+	url = https://maxx-abrt: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@github.com/maxx-abrt/algorithmic-trading-dashboard.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "main"]
+	remote = origin
+	merge = refs/heads/main
