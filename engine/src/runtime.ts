@@ -144,6 +144,7 @@ export class Runtime {
   harvester: Harvester
   paperTrades = new Map<string, PaperTrade>()
   paperKillSwitch = this.store.getState<boolean>('paper_kill_switch', false)
+  private lastDrySpellFactor: number | null = null
   latestCandidates = new Map<string, StrategyCandidate[]>()
   latestVerdicts = new Map<string, CommitteeVerdict>()
   counters = { evaluations: 0, alerts: 0, signals: 0, errors: 0, wsMessages: 0, demoOrders: 0 }
@@ -561,16 +562,42 @@ export class Runtime {
    * If no trades have been armed in 2+ hours, progressively lower the gates so
    * the system can generate evidence. Without this, a tight-gate deadlock
    * prevents any trades from ever firing, so no learning can happen.
-   * Returns a multiplier < 1.0 during dry spells, 1.0 otherwise.
+   *
+   * Restoration is gradual: after a trade fires, gates ramp back up over 4 hours
+   * (0.6 → 0.8 → 1.0) rather than snapping to 1.0 instantly. This prevents a
+   * single lucky trade from re-locking the system if market conditions haven't
+   * actually improved.
+   *
+   * Returns a multiplier < 1.0 during dry spells, 1.0 at full strength.
    */
   private drySpellFactor(): number {
     const lastArmedAt = this.store.getState<number>('last_trade_armed_at', 0)
-    if (!lastArmedAt) return 0.6 // cold start: be permissive
+    if (!lastArmedAt) {
+      const factor = 0.6 // cold start: be permissive to bootstrap evidence
+      if (this.lastDrySpellFactor !== factor) {
+        log.info('gates', `cold start — gates at ${(factor * 100).toFixed(0)}% (conviction ≥ ${Math.round(this.settings.minConfidence * factor)}, composite ≥ ${Math.max(3, Math.round(this.settings.minCompositeScore * factor))})`)
+        this.lastDrySpellFactor = factor
+      }
+      return factor
+    }
     const elapsed = Date.now() - lastArmedAt
-    if (elapsed < 2 * 60 * 60_000) return 1.0 // normal: use configured gates
-    if (elapsed < 4 * 60 * 60_000) return 0.7 // 2-4h dry: lower to 70%
-    if (elapsed < 8 * 60 * 60_000) return 0.5 // 4-8h dry: lower to 50%
-    return 0.4 // 8h+ dry: very permissive to break the deadlock
+    let factor: number
+    if (elapsed < 30 * 60_000) factor = 0.6 // first 30m after a trade: stay permissive to catch follow-through
+    else if (elapsed < 1 * 60 * 60_000) factor = 0.8 // 30m-1h: ramping up
+    else if (elapsed < 2 * 60 * 60_000) factor = 1.0 // 1-2h: full strength
+    else if (elapsed < 4 * 60 * 60_000) factor = 0.7 // 2-4h dry: lowering
+    else if (elapsed < 8 * 60 * 60_000) factor = 0.5 // 4-8h dry: lower
+    else factor = 0.4 // 8h+ dry: very permissive to break the deadlock
+
+    if (this.lastDrySpellFactor !== factor) {
+      if (factor < 1.0) {
+        log.info('gates', `dry-spell breaker active — gates at ${(factor * 100).toFixed(0)}% (conviction ≥ ${Math.round(this.settings.minConfidence * factor)}, composite ≥ ${Math.max(3, Math.round(this.settings.minCompositeScore * factor))})`)
+      } else if (this.lastDrySpellFactor != null && this.lastDrySpellFactor < 1.0) {
+        log.info('gates', `gates restored to 100% — conviction ≥ ${this.settings.minConfidence}, composite ≥ ${this.settings.minCompositeScore}`)
+      }
+      this.lastDrySpellFactor = factor
+    }
+    return factor
   }
 
   key(instId: string, timeframe: string) {
