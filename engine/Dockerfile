@@ -11,8 +11,7 @@ COPY --from=deps /app/engine/node_modules ./node_modules
 COPY package.json yarn.lock tsconfig.json ./
 COPY src ./src
 COPY scripts ./scripts
-RUN mkdir -p data backups && chown -R node:node /app/engine
-USER node
+RUN mkdir -p data backups
 EXPOSE 8790
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD node -e "fetch('http://127.0.0.1:8790/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=5 CMD node -e "fetch('http://127.0.0.1:8790/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
 CMD ["yarn", "start"]
