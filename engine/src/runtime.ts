@@ -243,7 +243,7 @@ export class Runtime {
     every(10 * 60_000, () => this.maintenanceLoop(), 'maintenance')
     every(5 * 60_000, () => this.evolutionLoop(), 'evolution')
     every(30 * 60_000, () => this.autoResearchLoop(), 'auto-research')
-    every(6 * 60 * 60_000, () => this.backupLoop(), 'backup')
+    every(60 * 60_000, () => this.backupLoop(), 'backup')
     every(15 * 60_000, () => this.refreshMarketContext(), 'market-context')
     every(15 * 60_000, () => this.refreshCrossAsset(), 'cross-asset')
     every(30 * 60_000, () => this.refreshOnChain(), 'on-chain')
@@ -257,6 +257,7 @@ export class Runtime {
     every(60_000, () => this.refreshAccount(), 'account')
     every(60 * 60_000, () => this.harvestLoop(), 'harvest')
     log.info('boot', 'all loops armed')
+    void this.backupLoop()
   }
 
   /* ---- configuration (SQLite only) ------------------------------------- */
@@ -1440,6 +1441,17 @@ export class Runtime {
       ai: { ...this.gemini.stats(), monthlySpendEur: aiUsage.spend, monthlyBudgetEur: this.settings.aiMonthlyBudgetEur, budgetBlocked: aiUsage.spend >= this.settings.aiMonthlyBudgetEur },
       telegram: { ...this.bot.stats(), chats: this.chats.length, muted: this.mutedChats.size },
       storage: { ...disk, restoredFrom: this.store.restoredFrom, backups: listBackups().length, tables: this.store.summary() },
+      dataFreshness: (() => {
+        const tables = this.store.summary()
+        const uptimeSec = Math.floor((Date.now() - this.startedAt) / 1000)
+        const isEmpty = tables.candles === 0 && tables.paperTrades === 0 && tables.decisions === 0
+        return {
+          likelyWiped: isEmpty && uptimeSec > 60 && !this.store.restoredFrom,
+          dbHasData: !isEmpty,
+          restoredFromBackup: this.store.restoredFrom !== null,
+          uptimeSec,
+        }
+      })(),
       paper: { ...this.store.paperStats(), active: this.store.loadActiveTrades().length, killSwitch: this.paperKillSwitch },
       evolution: {
         validationState: snapshot.validationState,

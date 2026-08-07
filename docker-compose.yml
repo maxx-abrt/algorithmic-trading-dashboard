@@ -13,9 +13,16 @@ services:
       RESEARCH_MAX_LOAD: ${RESEARCH_MAX_LOAD:-6}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      OKX_API_KEY: ${OKX_API_KEY:-}
+      OKX_API_SECRET: ${OKX_API_SECRET:-}
+      OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE:-}
+      OKX_SIMULATED: ${OKX_SIMULATED:-false}
+      CONVEX_URL: ${CONVEX_URL:-}
+      CONVEX_MIRROR: ${CONVEX_MIRROR:-}
+      WORKER_API_KEY: ${WORKER_API_KEY:-}
     volumes:
-      - mycroft-data:/app/engine/data
-      - mycroft-backups:/app/engine/backups
+      - /opt/mycroft/data:/app/engine/data
+      - /opt/mycroft/backups:/app/engine/backups
     expose:
       - "8790"
     deploy:
@@ -28,6 +35,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+  pre-deploy-backup:
+    image: alpine:3.20
+    volumes:
+      - /opt/mycroft/data:/data:ro
+      - /opt/mycroft/backups:/backups
+    command: sh -c "cp /data/mycroft.sqlite /backups/pre-deploy-$$(date +%s).sqlite 2>/dev/null && echo 'pre-deploy backup done' || echo 'no db to back up yet'"
+    restart: "no"
 
   frontend:
     build:
@@ -51,7 +66,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-volumes:
-  mycroft-data:
-  mycroft-backups:
