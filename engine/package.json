@@ -9,6 +9,7 @@
     "dev": "tsx watch --clear-screen=false src/index.ts",
     "poc": "tsx scripts/poc.ts",
     "core:poc": "tsx scripts/core-poc.ts",
+    "poc:core": "tsx scripts/poc-core.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
