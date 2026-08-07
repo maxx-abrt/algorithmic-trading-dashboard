@@ -329,6 +329,12 @@ const routes: Record<string, Handler> = {
     return { queued: true, progress: runtime.harvester.progress }
   },
 
+  'POST /api/harvest/reset': () => {
+    const wasRunning = runtime.harvester.progress.running
+    runtime.harvester.progress = { ...runtime.harvester.progress, running: false, finishedAt: Date.now(), lastError: wasRunning ? 'manually reset' : '' }
+    return { reset: true, wasRunning }
+  },
+
   'POST /api/evolution/run': async (req) => {
     const body = await readBody(req)
     const eligible = runtime.evolution.eligibleNiches(runtime.settings)

@@ -53,6 +53,19 @@ const closedAt = (candle: Candle, timeframe: string) => {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
+/** Timeout wrapper: rejects after ms milliseconds so a single hung fetch cannot stall the harvest. */
+async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 export class Harvester {
   progress: HarvestProgress = {
     running: false,
@@ -101,8 +114,14 @@ export class Harvester {
   }
 
   async run(request: HarvestRequest = {}): Promise<HarvestProgress> {
+    // Auto-recover from a crashed previous run: if running is true but startedAt
+    // is more than 30 minutes ago, the previous harvest died without calling finish().
+    if (this.progress.running && Date.now() - this.progress.startedAt > 30 * 60_000) {
+      log.info('harvest', `stale run detected (started ${Math.round((Date.now() - this.progress.startedAt) / 60_000)}m ago) — force resetting`)
+      this.progress = { ...this.progress, running: false, finishedAt: Date.now(), lastError: 'auto-recovered from stale state' }
+    }
     if (this.progress.running) return this.progress
-    const timeframes = request.timeframes?.length ? request.timeframes : ['15m', '1H']
+    const timeframes = request.timeframes?.length ? request.timeframes : ['15m', '30m', '1H']
     const barsPerSymbol = Math.min(1500, Math.max(300, request.barsPerSymbol ?? 900))
     const maxWallMs = Math.min(20 * 60_000, Math.max(30_000, request.maxWallMs ?? 6 * 60_000))
     const deadline = Date.now() + maxWallMs
@@ -167,9 +186,9 @@ export class Harvester {
     const lastDone = this.cursor()[cursorKey] ?? 0
     const [htfName, htf2Name] = higherTimeframes(timeframe)
     const [ltfRaw, htf, htf2] = await Promise.all([
-      fetchCandles(symbol, timeframe, bars, { history: true }),
-      fetchCandles(symbol, htfName, Math.round(bars * 0.7), { history: true }),
-      fetchCandles(symbol, htf2Name, Math.round(bars * 0.4), { history: true }),
+      withTimeout(fetchCandles(symbol, timeframe, bars, { history: true }), 30_000, `fetchCandles ${symbol} ${timeframe}`),
+      withTimeout(fetchCandles(symbol, htfName, Math.round(bars * 0.7), { history: true }), 30_000, `fetchCandles ${symbol} ${htfName}`),
+      withTimeout(fetchCandles(symbol, htf2Name, Math.round(bars * 0.4), { history: true }), 30_000, `fetchCandles ${symbol} ${htf2Name}`),
     ])
     const ltf = ltfRaw.filter((row) => row.confirmed)
     if (ltf.length < 300) return 0

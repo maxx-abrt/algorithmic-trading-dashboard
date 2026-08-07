@@ -35,7 +35,7 @@ export type CampaignType =
 
 export interface CampaignRequest {
   symbols?: string[]
-  timeframe?: '5m' | '15m' | '1H'
+  timeframe?: '5m' | '15m' | '30m' | '1H'
   maxEvaluations?: number
   hypothesis?: string
   autoPromote?: boolean
@@ -63,7 +63,7 @@ const closedAt = (candle: Candle, timeframe: string) => {
 
 interface CampaignConfig {
   symbols: string[]
-  timeframe: '5m' | '15m' | '1H'
+  timeframe: '5m' | '15m' | '30m' | '1H'
   maxEvaluations: number
   hypothesis: string
   useEnsemble: boolean
@@ -366,7 +366,7 @@ export class ResearchLab {
           }
         }
 
-        const foldMs = timeframe === '5m' ? 5 * 60_000 : timeframe === '1H' ? 3_600_000 : 15 * 60_000
+        const foldMs = timeframe === '5m' ? 5 * 60_000 : timeframe === '30m' ? 30 * 60_000 : timeframe === '1H' ? 3_600_000 : 15 * 60_000
         const folds = purgedWalkForward(samples, { folds: 4, purgeMs: foldMs * 12, embargoMs: foldMs * 12, minTrain: 10 })
         const metrics = validationMetrics(trades, symbols.length * 3)
         trials.push({ symbol, metrics, folds: folds.length })

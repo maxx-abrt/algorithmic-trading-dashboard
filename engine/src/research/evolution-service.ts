@@ -38,6 +38,7 @@ import {
 import type { Settings } from '../settings/schema.js'
 import type { PaperTrade } from '../paper/types.js'
 import { attributeTrade } from '../paper/attribution.js'
+import { barMinutes } from '../quant/timeframes.js'
 
 export interface EvolutionNotice {
   type: 'born' | 'promoted' | 'canary' | 'retired' | 'rolled_back' | 'rejected'
@@ -149,7 +150,9 @@ export class EvolutionService {
       const newSamples = row.samples - seen
       const intervalMs = settings.evolution.intervalMinutes * 60_000
       const dueByTime = Date.now() - (this.lastEvolvedAt.get(row.nicheKey) ?? 0) > intervalMs
-      if (newSamples < settings.evolution.minNewSamples && !(dueByTime && seen === 0)) continue
+      const overdueMs = intervalMs * 3
+      const overdue = Date.now() - (this.lastEvolvedAt.get(row.nicheKey) ?? 0) > overdueMs
+      if (newSamples < settings.evolution.minNewSamples && !(dueByTime && seen === 0) && !overdue) continue
       out.push({ niche: { playbook: row.playbook, instType: row.instType, timeframe: row.timeframe }, samples: row.samples, newSamples })
     }
     return out.sort((a, b) => b.newSamples - a.newSamples)
@@ -307,23 +310,36 @@ export class EvolutionService {
 
   /**
    * Sparse gating: pick the experts qualified to speak about THIS context.
-   *   exact niche              → trust 1.00
-   *   same playbook, other mkt → trust 0.55  (the pattern transfers, the venue does not)
-   *   same market + timeframe  → trust 0.30  (venue behaviour transfers, the setup does not)
-   * Everything else is not consulted at all.
+   *   exact niche                  → trust 1.00
+   *   same playbook, other mkt     → trust 0.55  (the pattern transfers, the venue does not)
+   *   same market + timeframe      → trust 0.30  (venue behaviour transfers, the setup does not)
+   *   same playbook + mkt, adj TF  → trust 0.35  (e.g., 15m specialist on 30m signal)
+   *   same playbook, adjacent TF   → trust 0.25  (pattern transfers across timeframes)
+   *   same mkt, adjacent TF        → trust 0.15  (venue transfers across timeframes)
+   *   same timeframe only          → trust 0.12  (weak signal, but better than nothing)
+   * Adjacent = within 4x timeframe ratio (15m↔30m, 30m↔1H, 1H↔4H).
    */
   route(context: RouteContext): CommitteeMember[] {
     const members: CommitteeMember[] = []
     const rows = [...this.store.listByLifecycle('champion'), ...this.store.listByLifecycle('canary')]
     for (const row of rows) {
+      const samePlaybook = row.playbook === context.playbook
+      const sameInstType = row.inst_type === context.instType
+      const sameTimeframe = row.timeframe === context.timeframe
+      const tfMin = barMinutes(row.timeframe)
+      const ctxTfMin = barMinutes(context.timeframe)
+      const tfRatio = Math.max(tfMin, ctxTfMin) / Math.min(tfMin, ctxTfMin)
+      const adjacentTf = !sameTimeframe && tfRatio <= 4
+
       const trust =
-        row.playbook === context.playbook && row.inst_type === context.instType && row.timeframe === context.timeframe
-          ? 1
-          : row.playbook === context.playbook && row.timeframe === context.timeframe
-            ? 0.55
-            : row.inst_type === context.instType && row.timeframe === context.timeframe
-              ? 0.3
-              : 0
+        samePlaybook && sameInstType && sameTimeframe ? 1.0
+        : samePlaybook && sameTimeframe ? 0.55
+        : sameInstType && sameTimeframe ? 0.30
+        : samePlaybook && sameInstType && adjacentTf ? 0.35
+        : samePlaybook && adjacentTf ? 0.25
+        : sameInstType && adjacentTf ? 0.15
+        : sameTimeframe ? 0.12
+        : 0
       if (trust === 0) continue
       const artifact = this.loadArtifact(row)
       if (!artifact) continue

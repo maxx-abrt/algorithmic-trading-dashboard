@@ -528,6 +528,7 @@ export class Runtime {
 
   engineSettings(instId: string, timeframe: string): EngineSettings {
     const s = this.settings
+    const drySpell = this.drySpellFactor()
     return {
       ...DEFAULT_SETTINGS,
       instId,
@@ -538,8 +539,8 @@ export class Runtime {
       riskPerTradePct: s.riskPerTradePct,
       leverage: s.leverage,
       rrRatio: s.rrRatio,
-      minConfidence: s.minConfidence,
-      minCompositeScore: s.minCompositeScore,
+      minConfidence: Math.round(s.minConfidence * drySpell),
+      minCompositeScore: Math.max(3, Math.round(s.minCompositeScore * drySpell)),
       requireMtfAlignment: s.requireMtfAlignment,
       usePatterns: s.usePatterns,
       useDerivatives: s.useDerivatives,
@@ -554,6 +555,22 @@ export class Runtime {
       equityUsd: s.equityUsd,
       aiModel: s.ai.model,
     }
+  }
+
+  /**
+   * If no trades have been armed in 2+ hours, progressively lower the gates so
+   * the system can generate evidence. Without this, a tight-gate deadlock
+   * prevents any trades from ever firing, so no learning can happen.
+   * Returns a multiplier < 1.0 during dry spells, 1.0 otherwise.
+   */
+  private drySpellFactor(): number {
+    const lastArmedAt = this.store.getState<number>('last_trade_armed_at', 0)
+    if (!lastArmedAt) return 0.6 // cold start: be permissive
+    const elapsed = Date.now() - lastArmedAt
+    if (elapsed < 2 * 60 * 60_000) return 1.0 // normal: use configured gates
+    if (elapsed < 4 * 60 * 60_000) return 0.7 // 2-4h dry: lower to 70%
+    if (elapsed < 8 * 60 * 60_000) return 0.5 // 4-8h dry: lower to 50%
+    return 0.4 // 8h+ dry: very permissive to break the deadlock
   }
 
   key(instId: string, timeframe: string) {
@@ -848,7 +865,8 @@ export class Runtime {
 
     if (this.paperKillSwitch) return
     if (a.decision === 'WAIT' || !a.plan) return
-    if (a.conviction < this.settings.minConfidence || a.plan.netExpectancyR <= 0) return
+    const drySpell = this.drySpellFactor()
+    if (a.conviction < Math.round(this.settings.minConfidence * drySpell) || a.plan.netExpectancyR <= 0) return
     if (a.vetoes.some((v) => v.severity === 'hard')) return
     if (!selected || !selected.eligible || selected.side !== a.decision) return
 
@@ -924,6 +942,7 @@ export class Runtime {
     this.counters.signals++
     this.store.saveTrade(trade)
     this.store.setState('last_risk_decision', risk)
+    this.store.setState('last_trade_armed_at', Date.now())
     log.signal('paper', `armed ${a.decision} ${a.instId} ${a.timeframe} · ${selected.playbook} · p=${(a.plan.winProbability * 100).toFixed(0)}%`, { instId: a.instId, timeframe: a.timeframe })
 
     await this.mirrorToDemo(trade, instType, selected.playbook, verdict)
@@ -1028,7 +1047,7 @@ export class Runtime {
 
       // Run the FULL pipeline on the strongest scanner candidates so opportunity is
       // not limited to the manually watched list.
-      for (const row of rows.filter((row) => Math.abs(row.score) >= 45).slice(0, 4)) {
+      for (const row of rows.filter((row) => Math.abs(row.score) >= 35).slice(0, 4)) {
         await this.analyzeInstrument(row.instId, cfg.timeframe, { withAi: false })
       }
     } finally {
@@ -1146,9 +1165,9 @@ export class Runtime {
     const total = this.evolution.store.sampleTotal()
     const cold = total < this.settings.evolution.minNicheSamples * 8
     const last = this.store.getState<{ at?: number }>('harvest_last', {})
-    if (!cold && Date.now() - (last.at ?? 0) < 12 * 60 * 60_000) return
+    if (!cold && Date.now() - (last.at ?? 0) < 4 * 60 * 60_000) return
     log.info('harvest', cold ? `cold start (${total} samples) — bootstrapping the evidence base` : 'scheduled top-up')
-    await this.harvester.run({ perType: cold ? 8 : 4, timeframes: cold ? ['15m', '1H'] : ['15m'], barsPerSymbol: cold ? 1200 : 600, maxWallMs: cold ? 10 * 60_000 : 4 * 60_000 })
+    await this.harvester.run({ perType: cold ? 8 : 4, timeframes: cold ? ['15m', '30m', '1H'] : ['15m', '30m', '1H'], barsPerSymbol: cold ? 1200 : 600, maxWallMs: cold ? 10 * 60_000 : 4 * 60_000 })
   }
 
   /** The self-improvement heartbeat: evolve, promote, roll back, refit anomaly. */
@@ -1453,6 +1472,7 @@ export class Runtime {
         }
       })(),
       paper: { ...this.store.paperStats(), active: this.store.loadActiveTrades().length, killSwitch: this.paperKillSwitch },
+      drySpell: { factor: this.drySpellFactor(), lastArmedAt: this.store.getState<number>('last_trade_armed_at', 0) },
       evolution: {
         validationState: snapshot.validationState,
         ...snapshot.summary,
