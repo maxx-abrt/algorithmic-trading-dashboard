@@ -210,7 +210,7 @@ export async function okxRequest<T = unknown>(
 ): Promise<T[]> {
   const method = opts.method ?? 'GET'
   const retries = opts.retries ?? 3
-  const timeoutMs = opts.timeoutMs ?? 12_000
+  const timeoutMs = opts.timeoutMs ?? 20_000
   const fullPath = buildPath(path, opts.params)
   const bodyStr = opts.body ? JSON.stringify(opts.body) : ''
 
@@ -249,6 +249,8 @@ export async function okxRequest<T = unknown>(
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
 
+    restStats.calls++
+    const startedAt = Date.now()
     try {
       const res = await fetch(REST_BASE + fullPath, {
         method,
@@ -259,6 +261,8 @@ export async function okxRequest<T = unknown>(
       })
 
       const text = await res.text()
+      restStats.lastLatencyMs = Date.now() - startedAt
+      restStats.avgLatencyMs = restStats.avgLatencyMs ? restStats.avgLatencyMs * 0.9 + restStats.lastLatencyMs * 0.1 : restStats.lastLatencyMs
 
       if (!res.ok) {
         if (RETRYABLE_HTTP.has(res.status) && attempt < retries) {

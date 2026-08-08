@@ -219,7 +219,7 @@ export const DEFAULT_RUNTIME_SETTINGS: Settings = {
     instTypes: ['SWAP', 'SPOT'],
     quoteCcy: 'USDT',
     minVol24hUsd: 3_000_000,
-    universeSize: 140,
+    universeSize: 110,
     intervalMs: 60_000,
     includeEquities: false,
     includeStables: false,

@@ -13,6 +13,8 @@ import type { DurableStore } from './durable.js'
 
 const MAX_BARS = 600
 const SEED_BARS = 480
+/** Hard wall-clock budget for one seed before the caller is handed what exists. */
+const SEED_TIMEOUT_MS = Number(process.env.CANDLE_SEED_TIMEOUT_MS || 25_000)
 
 interface Series {
   instId: string
@@ -82,6 +84,45 @@ export class CandleStore {
 
     const task = (async () => {
       const wanted = Math.max(minBars, SEED_BARS)
+
+      /* ---- disk first ---------------------------------------------------- *
+       * The database already holds millions of confirmed bars. Re-downloading
+       * them on every boot wastes the OKX REST budget the live decision loops
+       * need, and makes a cold start depend on the network being fast. Hydrate
+       * from disk, and only reach for REST when the local tail is genuinely
+       * missing or stale.
+       */
+      if (!existing && this.durable) {
+        const local = this.durable.loadCandles(instId, normalizeBar(bar), wanted).filter((candle) => candle.confirmed)
+        if (local.length >= minBars) {
+          const newest = local[local.length - 1]?.ts ?? 0
+          const localStale = Date.now() - newest > step * 3
+          const hydrated: Series = {
+            instId,
+            bar: normalizeBar(bar),
+            candles: local.slice(-MAX_BARS),
+            seededAt: Date.now(),
+            updatedAt: localStale ? 0 : Date.now(),
+            wsUpdatedAt: 0,
+            gaps: 0,
+            repairs: 0,
+          }
+          hydrated.gaps = this.countGaps(hydrated.candles, step)
+          this.series.set(k, hydrated)
+          // Fresh enough to trade on immediately; the WebSocket keeps it hot from here.
+          if (!localStale) return hydrated.candles
+          // Stale tail: top up from REST, but we now only need the recent bars.
+          const tail = await fetchCandles(instId, bar, Math.min(300, wanted))
+          const merged = this.merge(hydrated.candles, tail)
+          hydrated.candles = merged
+          hydrated.updatedAt = Date.now()
+          hydrated.gaps = this.countGaps(merged, step)
+          this.series.set(k, hydrated)
+          this.durable?.upsertCandles(instId, hydrated.bar, merged)
+          return merged
+        }
+      }
+
       const fresh = await fetchCandles(instId, bar, wanted)
       const merged = this.merge(existing?.candles ?? [], fresh)
       const s: Series = {
@@ -105,7 +146,20 @@ export class CandleStore {
     })().finally(() => this.inflight.delete(k))
 
     this.inflight.set(k, task)
-    return task
+    // Never let a slow exchange wedge a decision loop. The seed keeps running in the
+    // background and will be ready for the next call; this call returns whatever is
+    // already known. A short series simply produces no decision, which is correct.
+    task.catch(() => [])
+    const budgetMs = Math.max(4_000, SEED_TIMEOUT_MS)
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const fallback = new Promise<Candle[]>((resolve) => {
+      timer = setTimeout(() => resolve(this.series.get(k)?.candles ?? existing?.candles ?? []), budgetMs)
+    })
+    try {
+      return await Promise.race([task, fallback])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   /** Apply a live WebSocket bar. */

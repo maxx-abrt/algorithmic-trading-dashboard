@@ -1045,9 +1045,20 @@ export class Runtime {
     }
 
     if (this.paperKillSwitch) return
-    if (a.decision === 'WAIT' || !a.plan) return
-    if (!selected || !selected.eligible || selected.side !== a.decision) return
     if (a.vetoes.some((v) => v.severity === 'hard')) return
+    // A WAIT decision still carries a fully costed shadow plan. Refusing to ever act on
+    // it is what starved the old build of forward evidence: the deterministic gate said
+    // no, so no trade existed, so no model could ever be validated. Exploration probes
+    // are allowed to use the shadow plan at a fraction of the size.
+    const livePlan = a.plan ?? a.shadowPlan
+    if (!livePlan) return
+    const side = livePlan.side
+    if (!selected || selected.side !== side) return
+    // Exploration may also use a NEAR-MISS candidate (one unmet condition), which is
+    // exactly the population the decision tape records. Requiring full eligibility for
+    // every trade means the niches the system most needs evidence from never produce any.
+    const nearMiss = !selected.eligible && selected.rejectionReasons.length <= 1
+    if (!selected.eligible && !nearMiss) return
 
     /* ---- exploration: the system must deliberately buy information -------
      * A purely greedy gate produces the deadlock this build was written to fix:
@@ -1062,23 +1073,23 @@ export class Runtime {
     const explorationWanted = this.settings.evolution.explorationRate > 0 && (coverage < this.settings.evolution.targetTapeRows || !hasChampion)
     const drySpell = this.drySpellFactor()
     const convictionGate = Math.round(this.settings.minConfidence * drySpell)
-    const meetsGate = a.conviction >= convictionGate && a.plan.netExpectancyR > 0
+    const meetsGate = a.decision !== 'WAIT' && Boolean(a.plan) && selected.eligible && a.conviction >= convictionGate && livePlan.netExpectancyR > 0
     const probeFloor = Math.max(30, Math.round(convictionGate * 0.72))
     const isProbe = !meetsGate && explorationWanted && a.conviction >= probeFloor
     if (!meetsGate && !isProbe) return
 
     const active = [...this.paperTrades.values()].filter((trade) => trade.status === 'pending' || trade.status === 'open')
-    if (active.some((trade) => trade.plan.instId === a.instId && trade.plan.timeframe === a.timeframe && trade.plan.side === a.decision)) return
+    if (active.some((trade) => trade.plan.instId === a.instId && trade.plan.timeframe === a.timeframe && trade.plan.side === side)) return
     const probeCount = active.filter((trade) => trade.plan.policyVersion.includes('probe')).length
     if (isProbe && probeCount >= Math.max(1, Math.round(this.settings.maxOpenPositions * this.settings.evolution.explorationRate))) return
 
-    const features = this.latestFeatures.get(this.key(a.instId, a.timeframe)) ?? this.featureSnapshotV3(a, selected.score, a.decision === 'SHORT' ? 'SHORT' : 'LONG')
+    const features = this.latestFeatures.get(this.key(a.instId, a.timeframe)) ?? this.featureSnapshotV3(a, selected.score, side)
     // The committee's champion decides HOW to manage the trade, not just whether to
     // take it: its proven exit variant is applied to the plan.
     const exitVariant = verdict?.exitVariantId ? EXIT_LIBRARY.find((entry) => entry.id === verdict.exitVariantId) : null
-    const planForBroker = { ...a.plan }
+    const planForBroker = { ...livePlan }
     if (exitVariant && exitVariant.tpR.length && exitVariant.allocations.length === exitVariant.tpR.length) {
-      const sign = a.decision === 'SHORT' ? -1 : 1
+      const sign = side === 'SHORT' ? -1 : 1
       const risk = Math.abs(planForBroker.entry - planForBroker.stopLoss) * (exitVariant.stopMult > 0 ? exitVariant.stopMult : 1)
       planForBroker.stopLoss = planForBroker.entry - sign * risk
       planForBroker.takeProfits = exitVariant.tpR.map((multiple, index) => ({
@@ -1196,7 +1207,7 @@ export class Runtime {
     this.population.pullArm(nicheId)
     log.signal(
       'paper',
-      `armed ${isProbe ? 'PROBE ' : ''}${a.decision} ${a.instId} ${a.timeframe} · ${selected.playbook} · p=${(a.plan.winProbability * 100).toFixed(0)}% · size ×${sizeMultiplier.toFixed(2)}${verdict ? ` · committee ${verdict.consensus}` : ''}`,
+      `armed ${isProbe ? 'PROBE ' : ''}${side} ${a.instId} ${a.timeframe} · ${selected.playbook} · p=${(livePlan.winProbability * 100).toFixed(0)}% · size ×${sizeMultiplier.toFixed(2)}${verdict ? ` · committee ${verdict.consensus}` : ''}`,
       { instId: a.instId, timeframe: a.timeframe },
     )
 
@@ -1270,14 +1281,25 @@ export class Runtime {
     if (Date.now() - this.scan.at < cfg.intervalMs) return
     this.scan.running = true
     const started = Date.now()
+    // A scan pass gets a hard wall-clock budget. Without it, one slow exchange link
+    // turns the first pass into a loop that never returns and the whole engine looks
+    // alive while doing nothing.
+    const scanDeadline = started + Math.min(120_000, Math.max(20_000, cfg.intervalMs * 2))
     try {
       const targets = this.scanTargets()
       const rows: ScanRow[] = []
+      // Seeding is incremental: a scan scores everything already in memory and only
+      // warms a bounded number of NEW series per cycle. Fetching every instrument in
+      // one pass makes a single scan take minutes on a slow link and starves the
+      // focus/watch loops of their REST budget.
+      let seedBudget = 18
       await Promise.all(
         targets.map((t) =>
           this.limiter.run(async () => {
+            if (Date.now() > scanDeadline) return
             try {
-              const candles = await candleStore.ensure(t.instId, cfg.timeframe, 260)
+              const cached = candleStore.peek(t.instId, cfg.timeframe)
+              const candles = cached && cached.length >= 120 ? cached : seedBudget-- > 0 ? await candleStore.ensure(t.instId, cfg.timeframe, 260) : []
               if (candles.length < 90) return
               const q = quickScore(candles, cfg.timeframe)
               rows.push({
@@ -1304,7 +1326,7 @@ export class Runtime {
       // not limited to the manually watched list. This used to be capped at 4 rows
       // with a score of 35+, which is the main reason almost nothing ever armed and
       // no forward evidence ever accumulated.
-      const deepTargets = rows.filter((row) => Math.abs(row.score) >= cfg.deepScanMinScore).slice(0, cfg.deepScanTop)
+      const deepTargets = Date.now() > scanDeadline ? [] : rows.filter((row) => Math.abs(row.score) >= cfg.deepScanMinScore).slice(0, cfg.deepScanTop)
       await Promise.all(
         deepTargets.map((row) =>
           this.limiter.run(async () => {
@@ -1321,7 +1343,7 @@ export class Runtime {
       // decisions, not just the scanner's own timeframe.
       const rotation = ['30m', '15m', '1H', '4H']
       const altTimeframe = rotation[this.scanRotation++ % rotation.length]
-      if (altTimeframe !== cfg.timeframe) {
+      if (altTimeframe !== cfg.timeframe && Date.now() < scanDeadline) {
         await Promise.all(
           deepTargets.slice(0, Math.max(2, Math.round(cfg.deepScanTop / 2))).map((row) =>
             this.limiter.run(async () => {
@@ -1450,6 +1472,10 @@ export class Runtime {
     let inserted = 0
     let scanned = 0
     const skipped: string[] = []
+    // The live decision loops share OKX's REST budget with this replay. Starving them
+    // is how a research job silently stops the trading engine, so the builder gets a
+    // small, explicit network allowance and otherwise works from local bars only.
+    let fetchBudget = 6
     const benchmarks = new Map<string, Candle[]>()
     for (const timeframe of timeframes) {
       const local = this.store.loadCandles('BTC-USDT-SWAP', timeframe, 1400).filter((candle) => candle.confirmed)
@@ -1470,7 +1496,7 @@ export class Runtime {
             spec,
             bars: 1100,
             benchmark: benchmarks.get(timeframe) ?? null,
-            allowFetch: true,
+            allowFetch: fetchBudget > 0,
             derivatives: this.derivCache.get(symbol)
               ? {
                   fundingRate: this.derivCache.get(symbol)?.data.fundingRate ?? null,
@@ -1483,7 +1509,9 @@ export class Runtime {
           })
           inserted += result.inserted
           scanned += result.scannedBars
+          if (result.fetched) fetchBudget--
           if (result.error) skipped.push(`${symbol} ${timeframe}: ${result.error}`)
+          await new Promise<void>((resolve) => setTimeout(resolve, 60))
         } catch (error) {
           skipped.push(`${symbol} ${timeframe}: ${error instanceof Error ? error.message : String(error)}`)
         }
