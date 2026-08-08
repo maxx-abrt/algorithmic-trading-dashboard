@@ -81,6 +81,8 @@ the brain, and checks the Gemini news digest and the OKX credential state.
 directory. See [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md) for the exact,
 minimal Coolify configuration, and [USAGE.md](./USAGE.md) for what runs by itself,
 what you can trigger by hand, and how to read the evidence.
+[ROADMAP.md](./ROADMAP.md) is the handoff: known edges, and the ordered work that
+takes this from a working system to a frontier-grade one.
 
 ## Interpretation limits
 

@@ -55,3 +55,16 @@ design_guidelines.md
 # github mirror git dir (local only)
 .git-github/
 engine/.env
+engine/backups/mycroft-2026-08-08T13-34-34-178Z.sqlite
+engine/backups/mycroft-2026-08-08T13-23-31-907Z.sqlite
+engine/backups/mycroft-2026-08-08T13-13-20-604Z.sqlite
+engine/backups/mycroft-2026-08-08T13-30-34-851Z.sqlite
+engine/backups/mycroft-2026-08-08T13-16-43-795Z.sqlite
+engine/backups/mycroft-2026-08-08T13-23-31-919Z.sqlite
+engine/backups/mycroft-2026-08-08T13-10-56-450Z.sqlite
+engine/backups/mycroft-2026-08-08T13-10-56-438Z.sqlite
+engine/backups/mycroft-2026-08-08T13-30-34-863Z.sqlite
+engine/backups/mycroft-2026-08-08T13-34-34-190Z.sqlite
+engine/backups/mycroft-2026-08-08T13-16-43-807Z.sqlite
+engine/backups/mycroft-2026-08-08T13-13-20-592Z.sqlite
+engine/data/mycroft.sqlite
