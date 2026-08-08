@@ -9,7 +9,8 @@
     "dev": "tsx watch --clear-screen=false src/index.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "poc": "tsx scripts/poc-core.ts"
+    "poc": "tsx scripts/poc-core.ts",
+    "poc:frontier": "tsx scripts/poc-frontier.ts"
   },
   "dependencies": {
     "better-sqlite3": "11.10.0",

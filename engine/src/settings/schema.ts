@@ -36,6 +36,13 @@ export const AiSchema = z
     cooldownMs: z.number().int().min(0).max(24 * 60 * 60_000),
     minConvictionToAsk: z.number().min(0).max(100),
     contextDepth: z.enum(['minimal', 'standard', 'deep']),
+    /** hourly batched news + macro-event digest on the cheapest capable model */
+    newsEnabled: z.boolean(),
+    cheapModel: z.string().min(1).max(80),
+    /** nightly what-worked / what-failed report */
+    postMortemEnabled: z.boolean(),
+    /** block new entries when the news risk score exceeds this */
+    newsRiskVeto: z.number().min(0).max(1),
   })
   .strict()
 
@@ -49,6 +56,12 @@ export const ScannerSchema = z
     universeSize: z.number().int().min(5).max(300),
     intervalMs: z.number().int().min(15_000).max(60 * 60_000),
     includeEquities: z.boolean(),
+    /** tokenized equities and stable/stable pairs are excluded by default */
+    includeStables: z.boolean(),
+    /** how many of the strongest scanner rows get the FULL analysis pipeline */
+    deepScanTop: z.number().int().min(1).max(40),
+    /** minimum |quick score| a row needs before it is worth a deep analysis */
+    deepScanMinScore: z.number().min(0).max(100),
   })
   .strict()
 
@@ -86,6 +99,14 @@ export const EvolutionSchema = z
     rollbackWindow: z.number().int().min(10).max(300),
     rollbackMaxDrawdownR: z.number().min(2).max(50),
     intervalMinutes: z.number().int().min(5).max(1440),
+    /** fraction of armed trades reserved for deliberate exploration probes */
+    explorationRate: z.number().min(0).max(0.8),
+    /** size multiplier applied to an exploration probe */
+    probeSizeMultiplier: z.number().min(0.05).max(1),
+    /** minimum recorded decisions a niche needs before breeding is attempted */
+    minTapeRows: z.number().int().min(120).max(20000),
+    /** target rows per niche for the coverage scheduler */
+    targetTapeRows: z.number().int().min(200).max(60000),
   })
   .strict()
 
@@ -99,6 +120,8 @@ export const ExecutionSchema = z
     demoSizeMultiplier: z.number().min(0.01).max(10),
     /** never send demo orders for instruments outside this list of types */
     demoInstTypes: z.array(z.enum(['SPOT', 'SWAP'])).min(1).max(2),
+    /** model fills locally from the live book when the exchange is unavailable */
+    simulatorEnabled: z.boolean(),
   })
   .strict()
 
@@ -137,6 +160,10 @@ export const SettingsSchema = z
     evolution: EvolutionSchema,
     execution: ExecutionSchema,
     engineEnabled: z.boolean(),
+    /** the self-driving improvement scheduler */
+    orchestratorEnabled: z.boolean(),
+    /** how often the orchestrator picks its next action, in seconds */
+    orchestratorIntervalSec: z.number().int().min(10).max(3600),
   })
   .strict()
 
@@ -181,6 +208,10 @@ export const DEFAULT_RUNTIME_SETTINGS: Settings = {
     cooldownMs: 300_000,
     minConvictionToAsk: 60,
     contextDepth: 'standard',
+    newsEnabled: true,
+    cheapModel: process.env.GEMINI_CHEAP_MODEL || 'gemini-3.1-flash-lite',
+    postMortemEnabled: true,
+    newsRiskVeto: 0.82,
   },
   scanner: {
     enabled: true,
@@ -188,9 +219,12 @@ export const DEFAULT_RUNTIME_SETTINGS: Settings = {
     instTypes: ['SWAP', 'SPOT'],
     quoteCcy: 'USDT',
     minVol24hUsd: 3_000_000,
-    universeSize: 90,
+    universeSize: 140,
     intervalMs: 60_000,
-    includeEquities: true,
+    includeEquities: false,
+    includeStables: false,
+    deepScanTop: 12,
+    deepScanMinScore: 18,
   },
   telegram: {
     enabled: true,
@@ -217,14 +251,21 @@ export const DEFAULT_RUNTIME_SETTINGS: Settings = {
     rollbackWindow: 30,
     rollbackMaxDrawdownR: 8,
     intervalMinutes: 30,
+    explorationRate: 0.3,
+    probeSizeMultiplier: 0.35,
+    minTapeRows: 260,
+    targetTapeRows: 4000,
   },
   execution: {
     okxDemoEnabled: true,
     maxConcurrentDemoOrders: 6,
     demoSizeMultiplier: 1,
     demoInstTypes: ['SWAP', 'SPOT'],
+    simulatorEnabled: true,
   },
   engineEnabled: true,
+  orchestratorEnabled: true,
+  orchestratorIntervalSec: 30,
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

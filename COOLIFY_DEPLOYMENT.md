@@ -1,91 +1,166 @@
-# Coolify deployment
+# COOLIFY DEPLOYMENT
 
-MYCROFT runs as two services from `docker-compose.yml`:
+Three containers, one persistent directory, zero manual steps after the first deploy.
 
-- `engine`: OKX public-data collector, quantitative analysis, paper broker, SQLite truth store, and bounded research worker
-- `frontend`: Next.js dashboard; `/api/*` is rewritten internally to `engine:8790`
+```
+  engine    :8790   market truth, decisions, arena, orchestrator, SQLite
+  brain     :8791   LightGBM + PyTorch MLP + PPO exit agent (reads the same SQLite)
+  frontend  :3000   dashboard  (this is the only service that needs the domain)
+```
 
-There is no trade service and no OKX private credential requirement.
+---
 
-## CRITICAL: Use Docker Compose, not Nixpacks
+## 1. On the host, once
 
-**Always deploy as a Docker Compose application in Coolify.** Do not deploy the engine and frontend as separate Nixpacks applications.
+SSH into the machine that runs Coolify and create the persistent directories. Both
+containers mount the same `data` directory: the engine writes the database, the
+brain writes its model artifacts into `data/brain`. One backup of this directory is
+a complete backup of everything the system has ever learned.
 
-Nixpacks builds have ephemeral filesystems — every redeploy starts with an empty container. This means the SQLite database, all candles, trades, models, and research are **wiped on every deploy**. The `nixpacks.toml` files exist only as a fallback for environments that cannot run Docker Compose.
+```bash
+sudo mkdir -p /opt/mycroft/data /opt/mycroft/backups
+sudo chmod -R 777 /opt/mycroft          # containers run as non-root in some images
+```
 
-If you previously deployed as separate Nixpacks apps:
-1. Delete both Nixpacks applications in Coolify.
-2. Create a new Docker Compose application from this repository.
-3. The named volumes `mycroft-data` and `mycroft-backups` will be created automatically and persist across redeploys.
+If you are migrating from an older single-container deployment, copy the existing
+database in before the first deploy:
 
-## Coolify setup
+```bash
+sudo cp /path/to/old/mycroft.sqlite /opt/mycroft/data/mycroft.sqlite
+```
 
-1. Create a **Docker Compose** application from this repository and the `main` branch. The provided `Dockerfile`s now use Node 22, so no extra build configuration is needed.
-2. Route the public domain to `frontend` port `3000`. Do not expose engine port `8790` publicly.
-3. **Verify persistent volumes exist after the first deploy.** In Coolify, check that the volumes `mycroft-data` and `mycroft-backups` are listed in the application's Storage/Volumes section. The compose file uses explicit `name:` properties so these volumes survive app recreation.
-4. Set optional secrets in Coolify, never in Git:
-   - `GEMINI_API_KEY` for budget-capped summaries/risk critique only
-   - `GEMINI_MODEL` (default `gemini-2.5-flash`)
-   - `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` only if notifications are wanted
-5. Leave all `OKX_API_*` variables unset. Public market data needs no credentials and the codebase has no order endpoint.
-6. If you deploy the services as individual Nixpacks applications instead of Docker Compose:
-   - **WARNING: Data will be wiped on every redeploy.** Nixpacks has no persistent volumes.
-   - If you must use Nixpacks, add persistent storage mounts in Coolify's application settings:
-     - Engine app: mount `/app/engine/data` and `/app/engine/backups` as persistent volumes
-   - `engine/nixpacks.toml` and `frontend/nixpacks.toml` pin the nixpkgs archive that ships Node 22.13.1, which also satisfies `vite@7.3.6`'s `>=22.12.0` requirement.
-   - `engine/nixpacks.toml` pins the nixpkgs archive for Node 22.13.1. No apt packages are installed — `better-sqlite3@11.10.0` ships prebuilt binaries for Node 22 linux-x64, so native compilation tooling is unnecessary.
-   - `package.json` `engines.node` and `.nvmrc` are set to `>=22.0.0` / `22` respectively as a fallback; you can additionally set the Coolify environment variable `NIXPACKS_NODE_VERSION=22` if your Coolify/Nixpacks version ignores those signals.
-7. Deploy, then verify:
-   - `/api/health` returns `ok: true`
-   - `dataFreshness.likelyWiped` is `false` — if `true`, the database was wiped and volumes are not persisting
-   - `dataFreshness.restoredFromBackup` is `false` on a healthy deploy — if `true`, the volume was empty but a backup saved you
-   - `ws.public.healthy` and `ws.business.healthy` are true after warm-up
-   - `research.validationState` may honestly remain `NO_VALIDATED_MODEL`
-   - Operations shows the SQLite database and backup status
+---
 
-## Resource and budget controls
+## 2. In Coolify
 
-Defaults are sized for an 8 GB host:
+1. **New Resource → Docker Compose**, point it at this repository, branch `main`,
+   compose file `docker-compose.yml`. Coolify reads all three services from it, so
+   you do not create them one by one.
+2. **Domain**: attach your domain to the **frontend** service, port **3000**.
+   Do not expose `engine` or `brain` publicly — the frontend proxies `/api/*` to the
+   engine internally, and the brain is only reachable from the engine.
+3. **Environment variables** (Coolify → the resource → Environment). Copy exactly:
 
-- Engine container limit: 2 GB
-- Frontend container limit: 768 MB
-- Research governor ceiling: 1.4 GB RSS and load 6
-- Research campaigns: at most 80 evaluations per symbol and three symbols
-- AI monthly budget: €10 hard application circuit breaker; set lower in Settings if desired
+```env
+# ── engine ────────────────────────────────────────────────────────────────────
+DEFAULT_EQUITY_USD=10000
+RESEARCH_MAX_RSS_MB=1400
+RESEARCH_MAX_LOAD=6
 
-Coolify/Docker, database volumes, and OS caches still consume host memory. Keep at least 2 GB headroom.
+# ── Google Gemini (news digest + nightly post-mortem) ─────────────────────────
+GEMINI_API_KEY=<your AI Studio key>
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_CHEAP_MODEL=gemini-3.1-flash-lite
 
-## Backup and restore
+# ── Telegram companion (optional) ─────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN=<botfather token>
+TELEGRAM_CHAT_ID=<your chat id>
 
-The Operations page creates online SQLite snapshots in the persistent backups volume. For restore:
+# ── OKX (public data needs NO keys; DEMO keys only measure fill quality) ───────
+OKX_API_KEY=<demo trading key>
+OKX_API_SECRET=<demo trading secret>
+OKX_API_PASSPHRASE=<demo trading passphrase>
+OKX_SIMULATED=true
 
-1. Stop the engine service.
-2. Copy the chosen backup to the `mycroft-data` volume as `mycroft.sqlite`.
-3. Preserve the previous database until `/api/health` and journal counts are verified.
-4. Start the engine; SQLite migrations are idempotent.
+# ── brain sidecar sizing for an 8 GB / 4-core box ─────────────────────────────
+BRAIN_MAX_RSS_MB=2200
+BRAIN_THREADS=3
+BRAIN_WORKERS=1
 
-## Updating
+# ── optional Convex mirror (leave empty to keep SQLite as the only truth) ─────
+CONVEX_URL=
+CONVEX_MIRROR=
+WORKER_API_KEY=
+```
 
-Pull `main` and redeploy both services. The engine schema migrates in place and uses WAL checkpoints. **Never delete the persistent volumes during an ordinary update.**
+4. **Deploy.** First build takes ~8–12 minutes (the brain image installs CPU PyTorch
+   and LightGBM). Later deploys are cached and take about a minute.
+5. **Nothing else.** No volumes to click, no extra services, no cron. The compose
+   file declares the bind mounts, the healthchecks and the pre-deploy backup.
 
-After redeploying, verify data persisted:
-1. Check `/api/health` — `dataFreshness.likelyWiped` must be `false`.
-2. Check the Operations page — table counts (candles, decisions, paper trades) should be non-zero and match or exceed pre-deploy values.
-3. If `dataFreshness.restoredFromBackup` is `true`, the volume was empty but the engine recovered from a backup snapshot. This means volumes are not persisting — see the troubleshooting section below.
+---
 
-## Troubleshooting data loss
+## 3. What to expect after the first deploy
 
-If data is wiped after every redeploy:
+| minute | what happens |
+|--------|--------------|
+| 0–2    | universe + tickers load, WebSocket feeds connect, scanner starts |
+| 2–20   | the orchestrator records the decision tape: real bars replayed through the live pipeline for every playbook × market × timeframe |
+| 20–40  | first breeding runs: policies are evolved and tested in the arena with purged walk-forward folds. Specialists that beat the baseline become canaries |
+| 40–90  | the brain trains LightGBM + MLP + ensemble, then a PPO exit agent, on the same recorded decisions |
+| hours  | live probe trades accumulate forward evidence; canaries with positive forward R become champions; decayed champions are re-verified and rolled back |
 
-1. **Check deployment type**: Confirm you are using Docker Compose, not Nixpacks. Nixpacks has no persistent volumes.
-2. **Check volume names**: Run `docker volume ls | grep mycroft` on the host. You should see `mycroft-data` and `mycroft-backups`. If not, volumes are not being created.
-3. **Check Coolify settings**: In the Coolify application settings, ensure "Delete volumes" or "Cleanup volumes" is NOT enabled.
-4. **Manual backup before redeploy**: If volumes are unreliable, SSH to the host and copy the DB before redeploying:
-   ```bash
-   docker cp $(docker ps -qf "name=engine"):/app/engine/data/mycroft.sqlite ./mycroft-backup.sqlite
-   ```
-5. **Manual restore after data loss**: Copy the backup back into the volume:
-   ```bash
-   docker cp ./mycroft-backup.sqlite $(docker ps -qf "name=engine"):/app/engine/data/mycroft.sqlite
-   ```
-   Then restart the engine container.
+Watch **Autopilot** in the dashboard: it shows the intent queue (what the system has
+decided to do next and why), the job history with results, execution quality, and the
+news signal.
+
+---
+
+## 4. Resource budget on an 8 GB / 4-core ThinkCentre
+
+| container | limit | typical |
+|-----------|-------|---------|
+| engine    | 2.0 GB | 300–600 MB |
+| brain     | 2.5 GB | 350 MB idle, 1.2–2.0 GB while training |
+| frontend  | 768 MB | 120 MB |
+| host / OS | —      | ~800 MB |
+
+Total ceiling ≈ 5.3 GB, leaving headroom for the page cache that SQLite depends on.
+Both the engine and the brain refuse to start heavy work when free RAM drops below
+~400 MB or the 1-minute load average exceeds `RESEARCH_MAX_LOAD`, so training always
+yields to the live decision loop.
+
+CPU: training is deliberately allowed to use most of the box (`BRAIN_THREADS=3` on a
+4-core machine) because every heavy loop yields to the event loop between units of
+work. If you ever see the dashboard lag, drop `BRAIN_THREADS` to 2.
+
+---
+
+## 5. Backups and restore
+
+* The engine writes an online SQLite snapshot to `/opt/mycroft/backups` every hour and
+  keeps the newest 12.
+* `pre-deploy-backup` copies the database before every deploy.
+* If `/opt/mycroft/data` is ever empty on boot, the engine automatically restores from
+  the newest snapshot and says so in the log and on the Ops page.
+
+Restore by hand:
+
+```bash
+sudo systemctl stop docker   # or stop the resource in Coolify
+sudo cp /opt/mycroft/backups/<snapshot>.sqlite /opt/mycroft/data/mycroft.sqlite
+```
+
+---
+
+## 6. OKX demo keys — the one thing that needs care
+
+Demo (simulated) trading keys are **not** the same as live API keys and are created on
+a different page:
+
+> OKX → **Demo Trading** → Personal Center → **Demo Trading API** → create key
+
+A live key, a deleted key, or a key from another account all fail with
+`50119 API key doesn't exist`. The dashboard shows that diagnosis verbatim on the
+Advisor and Autopilot pages.
+
+**This never blocks learning.** With no working key the engine uses its internal
+execution simulator, which models spread, depth consumption, partial fills, queue risk
+and latency from the live order book, and every fill statistic it produces is shown in
+Autopilot → Execution quality. A valid demo key simply adds real venue fills next to
+the modelled ones so the two can be compared.
+
+---
+
+## 7. Health checks
+
+```bash
+curl -s https://<your-domain>/api/health | jq '{population, orchestrator, execution: .execution.mode, brain: .brain.reachable}'
+curl -s https://<your-domain>/api/orchestrator | jq '.state.lastTask'
+curl -s https://<your-domain>/api/arena | jq '.runs[0]'
+```
+
+The system is healthy when `orchestrator.cycles` keeps rising, `population.tapeRows`
+keeps growing, and `arena` gains new runs. `NO_VALIDATED_MODEL` is a legitimate
+state: it means nothing has cleared every gate yet, which is the honest answer until
+it does.

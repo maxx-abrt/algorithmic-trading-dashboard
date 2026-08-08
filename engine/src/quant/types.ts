@@ -532,7 +532,9 @@ export interface InstrumentSpec {
   maxLever: number
   baseCcy: string
   quoteCcy: string
-  /** tokenized equity futures (NVDA-USDT-SWAP …) */
+  /** OKX asset class: '1' crypto, '3' tokenized equity, '4' index */
+  instCategory: string
+  /** tokenized equity futures (NVDA-USDT-SWAP …) or any non-crypto category */
   isEquity: boolean
 }
 

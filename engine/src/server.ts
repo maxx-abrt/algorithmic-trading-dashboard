@@ -21,6 +21,11 @@ import { signalCard, statusCard } from './telegram/cards.js'
 import { fetchDerivatives } from './okx/market.js'
 import { diskUsage, listBackups } from './store/backup.js'
 import { REASON_LABELS } from './paper/attribution.js'
+import { runArena, DEFAULT_ARENA_CONFIG } from './arena/arena.js'
+import { EXIT_LIBRARY } from './arena/exit-sim.js'
+import { FEATURE_SCHEMA_V3, FEATURE_ORDER_V3, FEATURE_COUNT_V3 } from './research/features-v3.js'
+import { predictWithArtifact, nicheKey as nicheKeyV3, nicheLabel as nicheLabelV3, parseNicheKey as parseNicheKeyV3 } from './research/breeder.js'
+import { allNiches } from './research/orchestrator.js'
 
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<unknown> | unknown
 
@@ -314,7 +319,12 @@ const routes: Record<string, Handler> = {
     }
   },
 
-  'GET /api/harvest': () => ({ progress: runtime.harvester.progress, last: runtime.store.getState('harvest_last', null), niches: runtime.evolution.store.nicheCounts() }),
+  'GET /api/harvest': () => ({
+    progress: runtime.harvester.progress,
+    last: runtime.store.getState('harvest_last', null),
+    niches: runtime.evolution.store.nicheCounts(),
+    tape: { rows: runtime.tape.count(), coverage: runtime.tape.coverage(), targetNiches: allNiches().map((niche) => nicheKeyV3(niche)) },
+  }),
 
   'POST /api/harvest/run': async (req) => {
     const body = await readBody(req)
@@ -361,6 +371,229 @@ const routes: Record<string, Handler> = {
     return { ok: true, artifactHash: hash, lifecycle }
   },
 
+  /* ---- V3: advisor, arena, brain, tape, orchestrator -------------------- */
+
+  'GET /api/advisor': (_req, _res, url) => {
+    const limit = num(url.searchParams.get('limit'), 24)
+    const actionableOnly = url.searchParams.get('actionable') === '1'
+    const calls = actionableOnly ? runtime.advisor.filter((call) => call.action !== 'WAIT') : runtime.advisor
+    return {
+      generatedAt: runtime.advisorAt,
+      news: runtime.news,
+      regime: runtime.regime,
+      population: runtime.population.summary(),
+      execution: runtime.executionDiagnosis(),
+      calls: calls.slice(0, limit),
+      watchlist: runtime.watchlist.map((row) => row.instId),
+      counters: runtime.counters,
+    }
+  },
+
+  'GET /api/arena': (_req, _res, url) => ({
+    runs: runtime.arenaStore.list(num(url.searchParams.get('limit'), 60), url.searchParams.get('nicheKey') ?? undefined),
+    coverage: runtime.tape.coverage(),
+    variants: EXIT_LIBRARY.map((variant) => ({ id: variant.id, label: variant.label })),
+    tapeRows: runtime.tape.count(),
+  }),
+
+  'GET /api/arena/run': (_req, _res, url) => {
+    const id = num(url.searchParams.get('id'), 0)
+    const run = runtime.arenaStore.get(id)
+    if (!run) throw new Error('arena run not found')
+    return run
+  },
+
+  'POST /api/arena/run': async (req) => {
+    const body = await readBody(req)
+    const playbook = String(body.playbook ?? '')
+    const instType = String(body.instType ?? '')
+    const timeframe = String(body.timeframe ?? '')
+    if (!playbook || !instType || !timeframe) throw new Error('playbook, instType and timeframe are required')
+    const artifactHash = body.artifactHash ? String(body.artifactHash) : null
+    const rows = runtime.tape.list({ playbook, instType, timeframe, featureSchema: FEATURE_SCHEMA_V3, limit: 30_000 })
+    if (rows.length < 200) throw new Error(`only ${rows.length} recorded decisions for that niche — need at least 200`)
+    const symbols = [...new Set(rows.map((row) => row.symbol))]
+    const holdout = symbols.length >= 3 ? [symbols[symbols.length - 1]] : []
+    const variantId = body.variantId ? String(body.variantId) : null
+
+    if (artifactHash) {
+      const specialist = runtime.population.get(artifactHash)
+      if (!specialist) throw new Error('specialist not found')
+      const artifact = runtime.orchestrator.loadArtifactFor(specialist)
+      if (!artifact) throw new Error('specialist artifact is not on disk')
+      const variant = EXIT_LIBRARY.find((entry) => entry.id === (variantId ?? artifact.genome.exitVariantId)) ?? EXIT_LIBRARY[0]
+      const report = runArena(
+        rows,
+        () => ({ scorer: (features) => predictWithArtifact(artifact, features), info: { frozen: true, artifactHash } }),
+        { ...DEFAULT_ARENA_CONFIG, label: `manual ${specialist.display_name}`, nicheKey: `${playbook}|${instType}|${timeframe}`, folds: num(String(body.folds ?? ''), 4), variants: [variant], thresholdGrid: [artifact.genome.thresholdQuantile], holdoutSymbols: holdout },
+      )
+      const id = runtime.arenaStore.save(report, artifactHash, 'manual')
+      return { id, report }
+    }
+
+    // Baseline campaign: no model, every exit variant compared head to head.
+    const report = runArena(rows, () => ({ scorer: () => 1, info: { baseline: true } }), {
+      ...DEFAULT_ARENA_CONFIG,
+      label: 'manual baseline sweep',
+      nicheKey: `${playbook}|${instType}|${timeframe}`,
+      folds: num(String(body.folds ?? ''), 4),
+      variants: variantId ? EXIT_LIBRARY.filter((entry) => entry.id === variantId) : EXIT_LIBRARY,
+      holdoutSymbols: holdout,
+    })
+    const id = runtime.arenaStore.save(report, null, 'manual')
+    return { id, report }
+  },
+
+  'GET /api/population': (_req, _res, url) => {
+    const rows = runtime.population.list(num(url.searchParams.get('limit'), 300))
+    return {
+      summary: runtime.population.summary(),
+      validationState: runtime.population.summary().champions > 0 ? 'VALIDATED' : runtime.population.summary().withArenaEdge > 0 ? 'ARENA_VALIDATED_PENDING_FORWARD' : 'NO_VALIDATED_MODEL',
+      specialists: rows.map((row) => ({
+        artifactHash: row.artifact_hash,
+        shortHash: row.artifact_hash.slice(0, 12),
+        nicheKey: row.niche_key,
+        nicheLabel: nicheLabelV3(parseNicheKeyV3(row.niche_key)),
+        playbook: row.playbook,
+        instType: row.inst_type,
+        timeframe: row.timeframe,
+        backend: row.backend,
+        brainModelId: row.brain_model_id,
+        generation: row.generation,
+        parentHash: row.parent_hash,
+        displayName: row.display_name,
+        lifecycle: row.lifecycle,
+        createdAt: row.created_at,
+        promotedAt: row.promoted_at,
+        retiredAt: row.retired_at,
+        arena: {
+          verdict: row.arena_verdict,
+          meanR: row.arena_mean_r,
+          meanRLift: row.arena_mean_r_lift,
+          oosTrades: row.arena_oos_trades,
+          foldsPositive: row.arena_folds_positive,
+          foldsTotal: row.arena_folds_total,
+          sharpe: row.arena_sharpe,
+          maxDrawdownR: row.arena_max_dd_r,
+          pValue: row.arena_p_value,
+          at: row.arena_at,
+          runId: row.arena_run_id,
+        },
+        live: { trades: row.live_trades, meanR: row.live_mean_r, winRate: row.live_win_rate, maxDrawdownR: row.live_max_dd_r, sumR: row.live_sum_r },
+        skills: row.skills_json ? JSON.parse(row.skills_json) : null,
+        genome: JSON.parse(row.genome_json || '{}'),
+        metrics: JSON.parse(row.metrics_json || '{}'),
+        trials: row.trials,
+        placeboScore: row.placebo_score,
+        rejectionReason: row.rejection_reason,
+      })),
+      generations: runtime.population.generationStats(),
+      events: runtime.population.events(80),
+      coverage: runtime.tape.coverage(),
+      targetNiches: allNiches().map((niche) => nicheKeyV3(niche)),
+      settings: runtime.settings.evolution,
+      legacy: { specialists: runtime.evolution.store.summary().specialists, note: 'v2 population kept for historical reference only; it is not used for live decisions' },
+    }
+  },
+
+  'POST /api/population/lifecycle': async (req) => {
+    const body = await readBody(req)
+    const hash = String(body.artifactHash ?? '')
+    const lifecycle = String(body.lifecycle ?? '')
+    if (!hash || !['shadow', 'canary', 'champion', 'retired', 'rejected'].includes(lifecycle)) throw new Error('artifactHash and a valid lifecycle are required')
+    const row = runtime.population.get(hash)
+    if (!row) throw new Error('specialist not found')
+    runtime.population.setLifecycle(hash, lifecycle as 'champion', body.reason ? String(body.reason) : 'manual override')
+    runtime.population.event({ type: lifecycle === 'champion' ? 'promoted' : 'retired', nicheKey: row.niche_key, artifactHash: hash, detail: `manual transition to ${lifecycle}` })
+    return { ok: true, artifactHash: hash, lifecycle }
+  },
+
+  'GET /api/orchestrator': () => ({ ...runtime.orchestrator.snapshot(), plan: runtime.orchestrator.plan(), settings: { enabled: runtime.settings.orchestratorEnabled, intervalSec: runtime.settings.orchestratorIntervalSec } }),
+
+  'POST /api/orchestrator/run': async (req) => {
+    const body = await readBody(req)
+    const kind = String(body.kind ?? '')
+    if (kind === 'tape_build') {
+      const niche = body.playbook && body.instType && body.timeframe ? { playbook: String(body.playbook), instType: String(body.instType), timeframe: String(body.timeframe) } : undefined
+      const result = await runtime.buildTapeTask({ niche, budgetMs: num(String(body.budgetMs ?? ''), 120_000) })
+      runtime.population.logJob({ kind: 'tape_build', target: niche ? `${niche.playbook}|${niche.instType}|${niche.timeframe}` : 'manual', status: 'done', detail: result.detail })
+      return result
+    }
+    if (kind === 'news') return { detail: await runtime.refreshNews() }
+    if (kind === 'postmortem') return { detail: await runtime.runPostMortem() }
+    if (kind === 'lifecycle') return { detail: runtime.orchestrator.lifecycle() }
+    if (kind === 'tick') {
+      await runtime.orchestrator.tick()
+      return { detail: runtime.orchestrator.state.lastTask?.detail ?? 'nothing due', task: runtime.orchestrator.state.lastTask }
+    }
+    if (kind === 'breed') {
+      const playbook = String(body.playbook ?? '')
+      const instType = String(body.instType ?? '')
+      const timeframe = String(body.timeframe ?? '')
+      if (!playbook || !instType || !timeframe) throw new Error('playbook, instType and timeframe are required')
+      const detail = await runtime.orchestrator.breedNow({ playbook, instType, timeframe })
+      return { detail }
+    }
+    throw new Error('kind must be one of tick, tape_build, breed, lifecycle, news, postmortem')
+  },
+
+  'GET /api/tape': (_req, _res, url) => {
+    const playbook = url.searchParams.get('playbook') ?? undefined
+    const instType = url.searchParams.get('instType') ?? undefined
+    const timeframe = url.searchParams.get('timeframe') ?? undefined
+    const rows = runtime.tape.listLight({ playbook, instType, timeframe, featureSchema: FEATURE_SCHEMA_V3, limit: num(url.searchParams.get('limit'), 400), desc: true })
+    return {
+      total: runtime.tape.count(),
+      coverage: runtime.tape.coverage(),
+      targetNiches: allNiches().map((niche) => nicheKeyV3(niche)),
+      featureSchema: FEATURE_SCHEMA_V3,
+      featureCount: FEATURE_COUNT_V3,
+      featureOrder: FEATURE_ORDER_V3,
+      rows: rows.map((row) => ({ at: row.at, symbol: row.symbol, netR: row.netR, label: row.label, regimeId: row.regimeId })),
+    }
+  },
+
+  'GET /api/brain': async (_req, _res, url) => {
+    const [health, jobs, models] = await Promise.all([runtime.brain.health(true), runtime.brain.jobs(num(url.searchParams.get('limit'), 30)), runtime.brain.models(120)])
+    return {
+      health,
+      jobs: jobs?.jobs ?? [],
+      running: jobs?.running ?? 0,
+      queued: jobs?.queued ?? 0,
+      models: models?.models ?? [],
+      url: runtime.brain.url,
+      featureOrder: FEATURE_ORDER_V3,
+      rlAgents: allNiches()
+        .map((niche) => ({ nicheKey: nicheKeyV3(niche), agent: runtime.store.getState<{ modelId: string; lift: number; at: number } | null>(`rl_agent:${nicheKeyV3(niche)}`, null) }))
+        .filter((row) => row.agent),
+    }
+  },
+
+  'POST /api/brain/train': async (req) => {
+    const body = await readBody(req)
+    const niche = { playbook: String(body.playbook ?? ''), instType: String(body.instType ?? ''), timeframe: String(body.timeframe ?? '') }
+    if (!niche.playbook || !niche.instType || !niche.timeframe) throw new Error('playbook, instType and timeframe are required')
+    const kind = String(body.kind ?? 'tabular')
+    const started = kind === 'rl' ? await runtime.brain.trainRl(niche, { epochs: num(String(body.epochs ?? ''), 16) }) : await runtime.brain.trainTabular(niche, { folds: num(String(body.folds ?? ''), 4) })
+    if (!started) throw new Error('brain is not reachable')
+    return started
+  },
+
+  'POST /api/brain/cancel': async (req) => {
+    const body = await readBody(req)
+    const jobId = String(body.jobId ?? '')
+    if (!jobId) throw new Error('jobId is required')
+    return (await runtime.brain.cancel(jobId)) ?? { error: 'brain unreachable' }
+  },
+
+  'GET /api/news': (_req, _res, url) => ({
+    current: runtime.news,
+    history: runtime.population.digests(num(url.searchParams.get('limit'), 30)),
+    postMortem: runtime.postMortem,
+    budget: { spentEur: runtime.store.aiUsageThisMonth().spend, budgetEur: runtime.settings.aiMonthlyBudgetEur },
+    settings: { newsEnabled: runtime.settings.ai.newsEnabled, cheapModel: runtime.settings.ai.cheapModel, postMortemEnabled: runtime.settings.ai.postMortemEnabled, newsRiskVeto: runtime.settings.ai.newsRiskVeto },
+  }),
+
   'GET /api/attribution': (_req, _res, url) => ({
     summary: runtime.evolution.store.attributionSummary(),
     rows: runtime.evolution.store.listAttribution(num(url.searchParams.get('limit'), 200)),
@@ -372,6 +605,9 @@ const routes: Record<string, Handler> = {
     parity: runtime.demo.parityReport(),
     orders: runtime.evolution.store.listOrders(num(url.searchParams.get('limit'), 120)),
     policy: runtime.settings.execution,
+    diagnosis: runtime.executionDiagnosis(),
+    simulator: runtime.simBroker.health(),
+    simOrders: runtime.simBroker.recent(num(url.searchParams.get('limit'), 120)),
   }),
 
   'GET /api/research/edge': () => ({

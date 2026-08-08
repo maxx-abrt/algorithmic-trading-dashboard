@@ -5,17 +5,20 @@ import { usePathname } from 'next/navigation'
 import { useState } from 'react'
 import { Button, Dialog } from '@/components/ui/kit'
 import { cn } from '@/lib/utils'
-import { Activity, BellRing, BookOpenCheck, Dna, Eye, FlaskConical, LineChart, Menu, Radar, ServerCog, Settings2 } from 'lucide-react'
+import { Activity, BellRing, BookOpenCheck, Brain, Dna, Eye, LineChart, Menu, Radar, Rocket, ServerCog, Settings2, Swords, Target } from 'lucide-react'
 
 const LINKS = [
+  { href: '/advisor', label: 'Advisor', icon: Target, group: 'primary' },
   { href: '/', label: 'Terminal', icon: LineChart, group: 'primary' },
-  { href: '/scanner', label: 'Scanner', icon: Radar, group: 'primary' },
+  { href: '/arena', label: 'Arena', icon: Swords, group: 'primary' },
   { href: '/evolution', label: 'Evolution', icon: Dna, group: 'primary' },
-  { href: '/journal', label: 'Journal', icon: BookOpenCheck, group: 'primary' },
-  { href: '/operations', label: 'Ops', icon: ServerCog, group: 'primary' },
+  { href: '/autopilot', label: 'Autopilot', icon: Rocket, group: 'primary' },
+  { href: '/brain', label: 'Brain', icon: Brain, group: 'secondary' },
+  { href: '/scanner', label: 'Scanner', icon: Radar, group: 'secondary' },
+  { href: '/journal', label: 'Journal', icon: BookOpenCheck, group: 'secondary' },
+  { href: '/operations', label: 'Ops', icon: ServerCog, group: 'secondary' },
   { href: '/watchlist', label: 'Watchlist', icon: Eye, group: 'secondary' },
   { href: '/alerts', label: 'Alerts', icon: BellRing, group: 'secondary' },
-  { href: '/research', label: 'Research', icon: FlaskConical, group: 'secondary' },
   { href: '/settings', label: 'Settings', icon: Settings2, group: 'secondary' },
 ]
 
@@ -51,7 +54,7 @@ export function TopNav() {
               </Link>
             ))}
           </nav>
-          <span className="ml-auto hidden shrink-0 rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground sm:inline">paper + okx demo</span>
+          <span className="ml-auto hidden shrink-0 rounded-md border border-border px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground lg:inline">advisory only · no live orders</span>
           <Button variant="ghost" size="icon" className="ml-auto md:hidden" onClick={() => setMoreOpen(true)} aria-label="Open more navigation" data-testid="mobile-nav-more">
             <Menu className="h-4 w-4" />
           </Button>

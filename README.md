@@ -1,89 +1,85 @@
-# MYCROFT — OKX Research OS
+# MYCROFT — self-improving OKX research OS
 
-A local-first decision-support and quantitative research system for OKX. It collects real public market data, explains explicit strategy candidates, simulates them with a stateful paper broker, and rejects models that fail leakage-aware validation.
+A local-first, 24/7 quantitative research and decision-support system for OKX. It
+records real market decisions, tests trading policies out of sample, evolves and
+trains models that beat their own baseline, and produces a ranked advisor feed:
+what to trade, which direction, entry, stop, take-profit ladder, size and expiry.
 
-**MYCROFT never places, amends, or cancels an order.** There is no trade endpoint in the codebase. Every LONG/SHORT plan is advisory and is automatically evaluated as a paper hypothesis.
+**MYCROFT never places, amends or cancels a real order.** Every plan is advisory and
+is automatically evaluated as a paper hypothesis with modelled execution costs.
 
-## What is implemented
+## The improvement loop
 
-- **Real OKX data:** public REST + WebSocket instruments, tickers, candles, funding, open interest, basis, order-book imbalance, taker flow, and positioning statistics
-- **Core horizons:** 5m, 15m, and 1H; BTC/ETH perpetual focus, liquid swap scanner, and a default spot basket covering BTC, ETH, SOL, XRP, DOGE, ADA, AVAX, and LINK
-- **Closed-bar analysis:** forming candles are excluded from decisions; gaps and repairs are explicit data-quality events
-- **Explicit playbooks:** trend pullback, volatility breakout, and range fade expose prerequisites, triggers, invalidation, and rejection reasons
-- **Paper broker:** pending entry zones, conservative fills, stop-first intrabar ambiguity, TP ladder, break-even after TP1, ATR trailing after TP2, time stops, gaps, fees, slippage, and funding
-- **Portfolio gates:** open-position, daily-loss, instrument-risk, portfolio-risk, gross-exposure, duplicate-exposure, and paper kill-switch controls
-- **Durable truth:** SQLite WAL stores candles, decisions, candidates, paper events, risk state, research campaigns, trials, models, quality events, and optional outbox data
-- **Honest research:** point-in-time slicing, purged chronological folds, embargoes, held-out ETH checks, bootstrap confidence bounds, deflated-Sharpe penalty, and explicit rejection gates
-- **Governed improvement:** bounded campaigns, resource governor, immutable manifests, model registry, shadow-only promotion state, and `NO_VALIDATED_MODEL` as a normal outcome
-- **Operations:** feed health, RAM/load, data quality, AI budget circuit breaker, online SQLite backup, and Coolify deployment files
-- **Optional Gemini:** adversarial summary/risk critique only. Local quant remains authoritative. Calls are cached, counted, and blocked at the configured monthly budget (maximum €10 in the UI)
-
-## Architecture
-
-```text
-OKX public REST + WebSocket
+```
+ OKX public REST + WebSocket
             |
             v
-engine/  Node + TypeScript
-  live analysis | paper broker | SQLite WAL | bounded research
-            |
-          /api/*
-            |
-frontend/ Next.js + React
-  terminal | scanner | portfolio | journal | research | operations
+ engine (Node 22 + TypeScript, :8790)
+   ingest -> indicators -> playbooks -> risk plan
+        -> DECISION TAPE   every decision + the price path that followed
+        -> ARENA           purged walk-forward tests of complete policies
+        -> BREEDER         evolution whose fitness IS the out-of-sample equity curve
+        -> COMMITTEE       skill-gated mixture of experts
+        -> PAPER BROKER    + internal execution simulator (spread, depth, latency)
+        -> ORCHESTRATOR    decides the single most valuable next action, forever
+            |                     |
+            | /api/*              | HTTP
+            v                     v
+ frontend (Next.js, :3000)   brain (Python, :8791)
+   Advisor / Arena / Brain     LightGBM + PyTorch MLP + ensemble
+   Evolution / Autopilot       PPO exit agent on real recorded paths
 ```
 
-Convex remains supported as an optional mirror for existing installations, but it is not required. SQLite is the local source of truth.
+## What makes it actually improve
+
+* **The decision tape.** Every historical and live decision is stored with its frozen
+  point-in-time feature vector *and* the price path that followed, as a compact
+  Float32 blob. Any exit policy, stop, take-profit ladder or RL agent can therefore be
+  re-simulated in microseconds without touching a candle again.
+* **The arena.** Fitness is not Brier score. A candidate is a complete policy
+  (feature mask, regularisation, exit variant, probability threshold) and it is scored
+  by replaying it through purged walk-forward folds: threshold and exit chosen on the
+  training slice only, measured on the test slice, compared against take-everything,
+  with a held-out symbol and a deflated Sharpe.
+* **Two-track promotion.** Arena evidence makes a specialist a canary. Only positive
+  FORWARD evidence from real closed trades makes it a champion. Either can demote it.
+* **Real DL and RL.** A Python sidecar trains LightGBM, a PyTorch MLP and their
+  calibrated ensemble with the same purged folds, and a PPO agent that manages open
+  positions bar by bar (hold / scale out / break-even / trail / close) on real paths,
+  judged against the plan's own exit on a held-out slice.
+* **Deliberate exploration.** A fixed share of arming slots is reserved for probe
+  trades in the niches with the least evidence, at reduced size. Without it the system
+  deadlocks: no trades -> no forward evidence -> no champion -> no trades.
+* **One feature schema.** 106 columns, identical in replay and live, with availability
+  flags for everything that only exists live (order book, macro, news). This removes
+  the train/serve distribution shift that made the previous build learn noise.
+* **Honest rejection.** `NO_VALIDATED_MODEL`, a failed placebo test and a negative
+  arena verdict are all normal, recorded outcomes.
 
 ## Local start
 
-Requirements: Node 22 (LTS), Yarn 1.x.
+Requirements: Node 22, Yarn 1.x, Python 3.11.
 
 ```bash
-cd engine
-yarn install --frozen-lockfile
-yarn typecheck
-yarn test
-yarn core:poc       # live OKX public-data proof; creates only temporary state
-yarn start          # engine on :8790
+cd engine && yarn install && yarn typecheck && yarn test && yarn poc:frontier
+yarn start                      # engine on :8790
+
+cd ../brain && pip install -r requirements.txt
+python -m uvicorn app:app --port 8791
+
+cd ../frontend && yarn install && yarn build && yarn serve   # dashboard on :3000
 ```
 
-In a second terminal:
+`yarn poc:frontier` is the proof-of-core script: it builds a tape from real OKX bars,
+asserts the exit simulator agrees with the live broker to 1e-6 R, asserts live/replay
+feature parity, runs a walk-forward arena campaign, trains LightGBM + MLP + PPO through
+the brain, and checks the Gemini news digest and the OKX credential state.
 
-```bash
-cd frontend
-yarn install --frozen-lockfile
-yarn build
-yarn dev            # dashboard on :3000; /api rewrites to :8790
-```
+## Deployment
 
-No OKX API key is required or recommended for this paper-only build.
-
-## Verification
-
-```bash
-cd engine
-
-yarn typecheck
-yarn test
-yarn core:poc
-
-cd ../frontend
-yarn build
-```
-
-The core POC uses confirmed real BTC-USDT-SWAP candles and verifies OKX contracts, SQLite recovery, candidate/rejection persistence, the paper state machine, and purged walk-forward splits. A negative result is valid: the objective is to reject false edge, not force a profitable-looking report.
-
-## Coolify
-
-Use `docker-compose.yml` and route the public domain to the frontend service on port 3000. Keep the data and backup volumes persistent. Full instructions are in [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md).
-
-Optional secrets belong in Coolify environment variables, never Git:
-
-- `GEMINI_API_KEY`
-- `GEMINI_MODEL`
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
+`docker-compose.yml` brings up engine + brain + frontend with one persistent
+directory. See [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md) for the exact,
+minimal Coolify configuration.
 
 ## Interpretation limits
 

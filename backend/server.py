@@ -45,7 +45,13 @@ client: httpx.AsyncClient | None = None
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global client
-    client = httpx.AsyncClient(base_url=ENGINE_URL, timeout=httpx.Timeout(90.0, connect=5.0))
+    # keepalive_expiry=0 stops httpx from reusing a socket the Node engine has
+    # already closed, which surfaced as intermittent 500 httpx.ReadError responses.
+    client = httpx.AsyncClient(
+        base_url=ENGINE_URL,
+        timeout=httpx.Timeout(90.0, connect=5.0),
+        limits=httpx.Limits(max_keepalive_connections=0, max_connections=64, keepalive_expiry=0.0),
+    )
     try:
         yield
     finally:
@@ -79,8 +85,35 @@ async def gateway(path: str, request: Request) -> Response:
         if k.lower() not in HOP_BY_HOP and k.lower() != "host"
     }
 
+    upstream = None
+    last_error: Exception | None = None
+    # One transparent retry: a dropped keep-alive socket must never surface as a 500.
+    for _ in range(2):
+        try:
+            upstream = await client.request(request.method, url, content=body or None, headers=headers)
+            last_error = None
+            break
+        except (httpx.ReadError, httpx.RemoteProtocolError, httpx.WriteError) as error:
+            last_error = error
+            continue
+        except httpx.ConnectError as error:
+            last_error = error
+            break
+    if upstream is None:
+        if isinstance(last_error, httpx.ConnectError):
+            return Response(
+                content='{"error":"decision engine unreachable","hint":"start it with: cd engine && yarn start"}',
+                status_code=503,
+                media_type="application/json",
+            )
+        return Response(
+            content='{"error":"engine connection dropped"}',
+            status_code=502,
+            media_type="application/json",
+        )
+
     try:
-        upstream = await client.request(request.method, url, content=body or None, headers=headers)
+        pass
     except httpx.ConnectError:
         return Response(
             content=(

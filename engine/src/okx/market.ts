@@ -61,6 +61,8 @@ interface RawInstrument {
   tickSz?: string
   lever?: string
   state?: string
+  /** OKX asset class: '1' crypto, '3' tokenized equity, '4' index/other */
+  instCategory?: string
   expTime?: string
   ctType?: string
 }
@@ -79,7 +81,8 @@ function toSpec(r: RawInstrument): InstrumentSpec {
     maxLever: num(r.lever, instType === 'SPOT' ? 1 : 10),
     baseCcy: r.baseCcy || parts[0] || '',
     quoteCcy: r.quoteCcy || r.settleCcy || parts[1] || '',
-    isEquity: isEquityInstrument(r.instId),
+    instCategory: r.instCategory || '1',
+    isEquity: isEquityInstrument(r.instId) || (r.instCategory ?? '1') !== '1',
   }
 }
 

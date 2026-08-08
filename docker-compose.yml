@@ -1,13 +1,27 @@
 services:
+  # ── pre-deploy safety net ────────────────────────────────────────────────────
+  # Copies the SQLite file before anything else starts. A redeploy must never be
+  # able to cost the system its memory.
+  pre-deploy-backup:
+    image: alpine:3.20
+    volumes:
+      - /opt/mycroft/data:/data:ro
+      - /opt/mycroft/backups:/backups
+    command: sh -c "cp /data/mycroft.sqlite /backups/pre-deploy-$$(date +%s).sqlite 2>/dev/null && echo 'pre-deploy backup done' || echo 'no db to back up yet'"
+    restart: "no"
+
+  # ── the engine: market truth, decisions, arena, orchestrator ────────────────
   engine:
     build:
       context: ./engine
     restart: unless-stopped
     environment:
       MYCROFT_DB_PATH: /app/engine/data/mycroft.sqlite
+      BRAIN_URL: http://brain:8791
       DEFAULT_EQUITY_USD: ${DEFAULT_EQUITY_USD:-10000}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_CHEAP_MODEL: ${GEMINI_CHEAP_MODEL:-gemini-3.1-flash-lite}
       RESEARCH_MAX_RSS_MB: ${RESEARCH_MAX_RSS_MB:-1400}
       RESEARCH_MAX_LOAD: ${RESEARCH_MAX_LOAD:-6}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
@@ -15,7 +29,7 @@ services:
       OKX_API_KEY: ${OKX_API_KEY:-}
       OKX_API_SECRET: ${OKX_API_SECRET:-}
       OKX_API_PASSPHRASE: ${OKX_API_PASSPHRASE:-}
-      OKX_SIMULATED: ${OKX_SIMULATED:-false}
+      OKX_SIMULATED: ${OKX_SIMULATED:-true}
       CONVEX_URL: ${CONVEX_URL:-}
       CONVEX_MIRROR: ${CONVEX_MIRROR:-}
       WORKER_API_KEY: ${WORKER_API_KEY:-}
@@ -30,19 +44,44 @@ services:
           memory: 2G
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8790/api/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
-      interval: 15s
-      timeout: 5s
+      interval: 20s
+      timeout: 6s
+      retries: 5
+      start_period: 90s
+
+  # ── the brain: LightGBM, PyTorch MLP, PPO exit agent ────────────────────────
+  # Reads the engine's SQLite read-only and writes its model artifacts to
+  # <data>/brain, so one volume backup contains the entire learned state.
+  brain:
+    build:
+      context: ./brain
+    restart: unless-stopped
+    environment:
+      BRAIN_DATA_DIR: /app/engine/data
+      BRAIN_DB_PATH: /app/engine/data/mycroft.sqlite
+      BRAIN_ARTIFACT_DIR: /app/engine/data/brain
+      BRAIN_MAX_RSS_MB: ${BRAIN_MAX_RSS_MB:-2200}
+      RESEARCH_MAX_LOAD: ${RESEARCH_MAX_LOAD:-6}
+      BRAIN_WORKERS: ${BRAIN_WORKERS:-1}
+      OMP_NUM_THREADS: ${BRAIN_THREADS:-3}
+      MKL_NUM_THREADS: ${BRAIN_THREADS:-3}
+      TORCH_NUM_THREADS: ${BRAIN_THREADS:-3}
+    volumes:
+      - /opt/mycroft/data:/app/engine/data
+    expose:
+      - "8791"
+    deploy:
+      resources:
+        limits:
+          memory: 2560M
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8791/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 8s
       retries: 5
       start_period: 60s
 
-  pre-deploy-backup:
-    image: alpine:3.20
-    volumes:
-      - /opt/mycroft/data:/data:ro
-      - /opt/mycroft/backups:/backups
-    command: sh -c "cp /data/mycroft.sqlite /backups/pre-deploy-$$(date +%s).sqlite 2>/dev/null && echo 'pre-deploy backup done' || echo 'no db to back up yet'"
-    restart: "no"
-
+  # ── the dashboard ───────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
@@ -64,4 +103,4 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 25s
