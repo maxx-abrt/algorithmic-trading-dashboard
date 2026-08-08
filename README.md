@@ -79,7 +79,8 @@ the brain, and checks the Gemini news digest and the OKX credential state.
 
 `docker-compose.yml` brings up engine + brain + frontend with one persistent
 directory. See [COOLIFY_DEPLOYMENT.md](./COOLIFY_DEPLOYMENT.md) for the exact,
-minimal Coolify configuration.
+minimal Coolify configuration, and [USAGE.md](./USAGE.md) for what runs by itself,
+what you can trigger by hand, and how to read the evidence.
 
 ## Interpretation limits
 
